@@ -1,0 +1,443 @@
+#!/usr/bin/env python3
+"""IC-7300 web control: CAT, panadapter, audio waterfall, CW/RTTY/FT8 decode.
+
+Usage: python3 server.py [--port 8073] [--serial /dev/ttyUSB0] [--audio NODE]
+Then open http://localhost:8073
+"""
+import argparse
+import asyncio
+import json
+import os
+import shutil
+import struct
+import subprocess
+import time
+
+import numpy as np
+from aiohttp import web, WSMsgType
+
+from decoders import FS, Spectrum, CWDecoder, RTTYDecoder, FT8Decoder
+from radio import IC7300
+import rig
+import clock
+from robot import CWRobot
+from spots import Spots
+from pathcheck import PathCheck
+from beacons import BeaconMonitor
+import geo
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+MSG_SCOPE, MSG_AUDIO, MSG_PCM = 1, 2, 3
+BEACON_LOCKED = {"freq", "mode", "ptt", "tune", "send_cw"}   # the beacon monitor owns the radio
+
+
+class App:
+    def __init__(self, args):
+        self.args = args
+        self.loop = None
+        self.clients = set()
+        # the last used radio if it is plugged in, else whichever is plugged in
+        detected = [r["name"] for r in rig.available() if r["connected"]]
+        last = rig.load_settings().get("radio")
+        self.radio_name = (args.radio or (last if last in detected else None)
+                           or (detected[0] if detected else None) or last or "IC-7300")
+        self.radio = self.make_radio(self.radio_name, startup=True)
+        self.audio = None
+        self.clock = clock.status()     # PC clock vs NTP, rechecked every minute
+        self.spectrum = Spectrum()
+        self.cw = CWDecoder(600)   # IC-7300 default CW pitch
+        self.rtty = RTTYDecoder(2210)
+        self.ft8 = FT8Decoder()
+        self.enabled = {"cw": True, "rtty": False, "ft8": False}
+        self.audio_ok = False
+        self.ft8_busy = False
+        self.listeners = set()      # websockets that want the receive audio
+        self.robot = CWRobot(self)
+        self.spots = Spots()
+        self.pathcheck = PathCheck(self)
+        self.beacons = BeaconMonitor(self)
+
+    # ---- broadcast helpers (thread-safe) -----------------------------
+    def _send_all(self, data):
+        for ws in list(self.clients):
+            if ws.closed:
+                self.clients.discard(ws)
+                continue
+            coro = ws.send_bytes(data) if isinstance(data, bytes) else ws.send_str(data)
+            asyncio.ensure_future(coro)
+
+    def broadcast(self, data):
+        if self.loop:
+            self.loop.call_soon_threadsafe(self._send_all, data)
+
+    def broadcast_json(self, **msg):
+        self.broadcast(json.dumps(msg))
+
+    # ---- radio callbacks (reader thread) -----------------------------
+    def on_state(self, changed):
+        self.broadcast_json(type="state", state=changed)
+        if "cw_pitch" in changed and self.loop:
+            # keep the CW decoder on the radio's sidetone pitch (where a zero-beat signal lands)
+            self.loop.call_soon_threadsafe(self.follow_pitch, changed["cw_pitch"])
+
+    def on_scope(self, lo, hi, px):
+        self.broadcast(struct.pack("<Bii", MSG_SCOPE, lo, hi) + px)
+
+    def decoder_status(self):
+        return {"cw_freq": self.cw.freq, "cw_wpm": round(self.cw.wpm, 1),
+                "cw_squelch": self.cw.squelch, "rtty_freq": self.rtty.center, "rtty_mark_high": self.rtty.mark_high,
+                "rtty_shift": self.rtty.shift, "rtty_baud": self.rtty.baud,
+                "ft4": self.ft8.ft4, "enabled": self.enabled, "audio": self.audio_ok}
+
+    # ---- radio selection ----------------------------------------------
+    def make_radio(self, name, startup=False):
+        a = self.args
+        port = a.serial if startup and a.serial else rig.find_port(name)
+        if name == "IC-7300":
+            return IC7300(port, a.baud, int(a.civ, 16))
+        return rig.make(name, port)
+
+    def radios_info(self, avail=None):
+        return {"type": "radios", "current": self.radio_name, "radios": avail or rig.available(), "caps": self.radio.caps}
+
+    def clock_msg(self):
+        return {"type": "clock", "clock": self.clock, "text": clock.describe(self.clock)}
+
+    async def clock_watch(self):
+        """The beacon monitor and FT8 depend on the PC clock: recheck NTP sync every minute."""
+        while True:
+            try:
+                s = await self.loop.run_in_executor(None, clock.status)
+                if s.get("ok") != self.clock.get("ok"):
+                    print(clock.describe(s))
+                    self.broadcast_json(type="notice", msg=clock.describe(s))
+                self.clock = s
+                self.broadcast_json(**self.clock_msg())
+            except Exception as e:
+                print("clock check:", e)
+            await asyncio.sleep(60)
+
+    async def radio_watch(self):
+        """Every 2 s: which radios are plugged in. Updates the dropdown, follows a radio that
+        comes back on another port, and switches to a plugged-in radio when the one in use
+        is unplugged (not while the robot or beacon monitor runs)."""
+        last = None
+        while True:
+            await asyncio.sleep(2)
+            try:
+                avail = await self.loop.run_in_executor(None, rig.available)
+            except Exception as e:
+                print("radio detection:", e)
+                continue
+            key = [(r["name"], r["connected"], r["port"]) for r in avail]
+            if key == last:
+                continue
+            if last is not None:
+                was = {n: c for n, c, _ in last}
+                for n, c, _ in key:
+                    if c != was.get(n):
+                        self.broadcast_json(type="notice", msg=f"{n} {'detected' if c else 'disconnected'}")
+            last = key
+            cur = next(r for r in avail if r["name"] == self.radio_name)
+            if cur["connected"] and cur["port"] != self.radio.port:
+                print(f"{self.radio_name} is now on {cur['port']}")
+                self.radio.port = cur["port"]          # the driver reopens it on its next attempt
+            other = next((r["name"] for r in avail if r["connected"] and r["name"] != self.radio_name), None)
+            if not cur["connected"] and other:
+                if self.robot.active or self.beacons.active:
+                    self.broadcast_json(type="notice", msg=f"{self.radio_name} is not connected; {other} is - "
+                                                           "stop the robot / beacon monitor to switch")
+                else:
+                    await self.select_radio(other)
+                    self.broadcast_json(type="notice", msg=f"switched to {other} ({cur['name']} not connected)")
+                    continue
+            self.broadcast_json(**self.radios_info(avail))
+
+    def audio_node(self):
+        return self.args.audio or rig.audio_node_for(self.radio.port)
+
+    def attach_radio(self):
+        self.radio.on_state = self.on_state
+        self.radio.on_scope = self.on_scope
+        self.radio.start()
+        if self.audio:
+            self.audio.cancel()
+        self.audio_ok = False
+        self.audio = asyncio.ensure_future(self.audio_task())
+
+    async def select_radio(self, name):
+        if name not in rig.RADIOS:
+            raise RuntimeError(f"unknown radio {name}")
+        if name == self.radio_name:
+            return
+        if self.robot.active or self.beacons.active:
+            raise RuntimeError("stop the CW robot / beacon monitor before switching radios")
+        old = self.radio
+        await self.loop.run_in_executor(None, old.stop)
+        self.radio_name, self.radio = name, self.make_radio(name)
+        rig.save_settings(radio=name)
+        self.attach_radio()
+        self.broadcast_json(**self.radios_info())
+        self.broadcast_json(type="state", state=self.radio.state)
+        self.broadcast_json(type="decoder", status=self.decoder_status())
+
+    # ---- audio --------------------------------------------------------
+    async def audio_task(self):
+        node = self.audio_node()
+        while True:
+            if shutil.which("pw-record") and node:
+                cmd = ["pw-record", "--target", node, "--rate", str(FS), "--channels", "1",
+                       "--format", "s16", "--latency", "50ms", "--raw", "-"]
+            else:
+                cmd = ["arecord", "-q", "-D", self.args.alsa, "-f", "S16_LE", "-r", str(FS),
+                       "-c", "1", "-t", "raw"]
+            print("audio:", " ".join(cmd))
+            proc = await asyncio.create_subprocess_exec(*cmd, stdout=asyncio.subprocess.PIPE,
+                                                        stderr=asyncio.subprocess.DEVNULL)
+            chunk = FS // 10 * 2  # 100 ms
+            try:
+                while True:
+                    data = await proc.stdout.readexactly(chunk)
+                    if not self.audio_ok:
+                        self.audio_ok = True
+                        self.broadcast_json(type="decoder", status=self.decoder_status())
+                    x = np.frombuffer(data, np.int16).astype(np.float32) / 32768
+                    self.process_audio(x, time.time())
+                    self.stream_audio(data)
+            except (asyncio.IncompleteReadError, ConnectionError):
+                pass
+            finally:
+                if proc.returncode is None:
+                    proc.kill()
+            self.audio_ok = False
+            self.broadcast_json(type="decoder", status=self.decoder_status())
+            print("audio stream ended; restarting in 2 s")
+            await asyncio.sleep(2)
+            node = self.audio_node()
+
+    def stream_audio(self, pcm):
+        if self.listeners:
+            msg = bytes([MSG_PCM]) + pcm
+            for ws in list(self.listeners):
+                if ws.closed:
+                    self.listeners.discard(ws)
+                else:
+                    asyncio.ensure_future(ws.send_bytes(msg))
+
+    def process_audio(self, x, t_end):
+        self.beacons.feed(x, t_end)
+        for row in self.spectrum.feed(x):
+            self._send_all(bytes([MSG_AUDIO]) + row)
+        if self.enabled["cw"]:
+            txt = self.cw.feed(x)
+            if txt:
+                self.broadcast_json(type="cw", text=txt, wpm=round(self.cw.wpm, 1))
+                self.robot.on_rx(txt)
+        if self.enabled["rtty"]:
+            txt = self.rtty.feed(x)
+            if txt:
+                self.broadcast_json(type="rtty", text=txt)
+        if self.enabled["ft8"]:
+            done = self.ft8.feed(x, t_end)
+            if done and not self.ft8_busy:
+                asyncio.ensure_future(self.run_ft8(*done))
+
+    async def run_ft8(self, slot_start, buf_start, audio):
+        self.ft8_busy = True
+        try:
+            res = await self.loop.run_in_executor(None, self.ft8.decode, slot_start, buf_start, audio)
+            self.broadcast_json(type="ft8", slot=time.strftime("%H:%M:%S", time.gmtime(slot_start)),
+                                decodes=res, ft4=self.ft8.ft4)
+        finally:
+            self.ft8_busy = False
+
+    # ---- websocket ----------------------------------------------------
+    async def ws_handler(self, request):
+        ws = web.WebSocketResponse(heartbeat=20, max_msg_size=1 << 20)
+        await ws.prepare(request)
+        self.clients.add(ws)
+        await ws.send_str(json.dumps(self.radios_info()))
+        await ws.send_str(json.dumps(self.clock_msg()))
+        await ws.send_str(json.dumps({"type": "state", "state": self.radio.state}))
+        await ws.send_str(json.dumps({"type": "decoder", "status": self.decoder_status()}))
+        await ws.send_str(json.dumps({"type": "robot", "status": self.robot.status()}))
+        await ws.send_str(json.dumps({"type": "pathcheck", "result": self.pathcheck.public()}))
+        await ws.send_str(json.dumps({"type": "beacons", "data": self.beacons.public()}))
+        try:
+            async for msg in ws:
+                if msg.type == WSMsgType.TEXT:
+                    try:
+                        m = json.loads(msg.data)
+                        if m.get("cmd") == "listen":
+                            (self.listeners.add if m.get("on") else self.listeners.discard)(ws)
+                            continue
+                        await self.handle_cmd(m)
+                    except Exception as e:
+                        await ws.send_str(json.dumps({"type": "error", "msg": str(e)}))
+        finally:
+            self.clients.discard(ws)
+            self.listeners.discard(ws)
+        return ws
+
+    async def handle_cmd(self, m):
+        r = self.radio
+        c = m.get("cmd")
+        if c in BEACON_LOCKED and self.beacons.active:
+            raise RuntimeError("NCDXF beacon monitor is running: stop it to tune, change mode or transmit")
+        run = lambda f, *a: self.loop.run_in_executor(None, f, *a)
+        if c == "freq":
+            await run(r.set_freq, m["hz"])
+        elif c == "mode":
+            await run(r.set_mode, m["mode"], m.get("filter"), m.get("data"))
+        elif c == "level":
+            await run(r.set_level, m["name"], m["value"])
+        elif c == "preamp":
+            await run(r.set_preamp, m["value"])
+        elif c == "att":
+            await run(r.set_att, m["value"])
+        elif c == "nb":
+            await run(r.set_nb, m["value"])
+        elif c == "nr":
+            await run(r.set_nr, m["value"])
+        elif c == "agc":
+            await run(r.set_agc, m["value"])
+        elif c == "ptt":
+            await run(r.set_ptt, bool(m["value"]))
+        elif c == "tune":
+            await run(r.tune)
+        elif c == "scope_span":
+            await run(r.set_scope_span, m["value"])
+        elif c == "scope_mode":
+            await run(r.set_scope_mode, m["value"])
+        elif c == "scope_speed":
+            await run(r.set_scope_speed, m["value"])
+        elif c == "select_radio":
+            await self.select_radio(m["name"])
+        elif c == "radios":
+            self.broadcast_json(**self.radios_info())
+        elif c == "send_cw":
+            await run(r.send_cw, m["text"])
+        elif c == "stop_cw":
+            await run(r.stop_cw)
+        elif c == "robot_config":
+            self.robot.configure(m.get("cfg", {}))
+            self.spots.set_call(self.robot.cfg["mycall"])
+            self.broadcast_json(type="robot", status=self.robot.status())
+            self.beacons.broadcast()       # distances use the station's grid
+        elif c == "robot_start":
+            self.robot.configure(m.get("cfg", {}))
+            self.spots.set_call(self.robot.cfg["mycall"])
+            self.robot.start(m["mode"], m.get("target"), m.get("other"))
+        elif c == "robot_stop":
+            await self.robot.stop()
+        elif c == "beacon_start":
+            self.beacons.start(m.get("cfg", {}))
+            self.beacons.broadcast()
+        elif c == "beacon_stop":
+            await self.beacons.stop()
+        elif c == "qso_edit":
+            self.robot.edit_qso(m["field"], m.get("value", ""))
+        elif c == "robot_inject":
+            self.robot.inject(m["text"])
+        elif c == "spots":
+            if m.get("call"):
+                self.spots.set_call(m["call"])
+            stations = await self.spots.active(m.get("band"), int(m.get("max_age", 900)),
+                                               self.my_location(), self.pathcheck)
+            self.broadcast_json(type="spots", band=m.get("band"), stations=stations, status=self.spots.status())
+        elif c == "decoder":
+            self.set_decoder(m)
+            self.broadcast_json(type="decoder", status=self.decoder_status())
+
+    def follow_pitch(self, pitch):
+        self.cw.set_freq(pitch)
+        self._send_all(json.dumps({"type": "decoder", "status": self.decoder_status()}))
+
+    def set_decoder(self, m):
+        if "enable" in m:
+            for k, v in m["enable"].items():
+                if k in self.enabled:
+                    self.enabled[k] = bool(v)
+        if "cw_freq" in m:
+            f = float(m["cw_freq"])
+            if m.get("snap"):
+                f = self.spectrum.peak_near(f)
+            self.cw.set_freq(f)
+        if "cw_squelch" in m:
+            self.cw.squelch = float(m["cw_squelch"])
+        if "rtty_freq" in m or "rtty_mark_high" in m:
+            self.rtty.set_freq(float(m.get("rtty_freq", self.rtty.center)), m.get("rtty_mark_high"))
+        if "ft4" in m:
+            self.ft8.set_ft4(bool(m["ft4"]))
+
+    async def spots_handler(self, request):
+        q = request.query
+        stations = await self.spots.active(q.get("band"), int(q.get("max_age", 900)),
+                                           self.my_location(), self.pathcheck)
+        return web.json_response({"stations": stations, "status": self.spots.status(),
+                                  "pathcheck": self.pathcheck.public()})
+
+    def my_location(self):
+        """Our (lat, lon): the robot's grid locator, else the callsign's country centre."""
+        loc = geo.grid_to_latlon(self.robot.cfg["grid"])
+        e = None if loc else geo.lookup(self.robot.cfg["mycall"] or self.spots.rbn.call)
+        return loc or ((e["lat"], e["lon"]) if e else None)
+
+    # ---- lifecycle ----------------------------------------------------
+    async def on_startup(self, app):
+        self.loop = asyncio.get_running_loop()
+        self.watch = asyncio.ensure_future(self.radio_watch())
+        self.clockwatch = asyncio.ensure_future(self.clock_watch())
+        print(clock.describe(self.clock))
+        if self.args.rbn_call:
+            self.spots.set_call(self.args.rbn_call)
+        self.attach_radio()
+
+    async def on_cleanup(self, app):
+        await self.robot.stop("server shutdown")
+        await self.beacons.stop()
+        self.watch.cancel()
+        self.clockwatch.cancel()
+        self.audio.cancel()
+        self.radio.stop()
+
+
+@web.middleware
+async def no_cache(request, handler):
+    """Make browsers revalidate the UI files so edits show up without a hard reload."""
+    resp = await handler(request)
+    if request.path == "/" or request.path.startswith("/static/"):
+        resp.headers["Cache-Control"] = "no-cache"
+    return resp
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--host", default="127.0.0.1")
+    ap.add_argument("--port", type=int, default=8073)
+    ap.add_argument("--radio", choices=list(rig.RADIOS), help="radio to start with (default: last used)")
+    ap.add_argument("--settings", default=None, help="settings file (default settings.json)")
+    ap.add_argument("--serial", default=None, help="CAT serial port of the starting radio (auto-detect)")
+    ap.add_argument("--baud", type=int, default=115200)
+    ap.add_argument("--civ", default="94", help="radio CI-V address, hex")
+    ap.add_argument("--audio", default=None, help="PipeWire source node name (auto-detect)")
+    ap.add_argument("--rbn-call", default=None, help="callsign for the Reverse Beacon Network login (CW spots)")
+    ap.add_argument("--alsa", default="plughw:CODEC,0", help="ALSA device if pw-record missing")
+    args = ap.parse_args()
+    if args.settings:
+        rig.SETTINGS = args.settings
+
+    a = App(args)
+    app = web.Application(middlewares=[no_cache])
+    app.on_startup.append(a.on_startup)
+    app.on_cleanup.append(a.on_cleanup)
+    app.router.add_get("/ws", a.ws_handler)
+    app.router.add_get("/api/spots", a.spots_handler)
+    app.router.add_get("/", lambda r: web.FileResponse(os.path.join(HERE, "static", "index.html")))
+    app.router.add_static("/static", os.path.join(HERE, "static"))
+    print(f"Open http://{args.host}:{args.port}")
+    web.run_app(app, host=args.host, port=args.port, print=None)
+
+
+if __name__ == "__main__":
+    main()

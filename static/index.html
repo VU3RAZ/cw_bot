@@ -1,0 +1,256 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Radio Web</title>
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<header>
+  <div class="brand"><span id="conn" class="dot"></span><select id="radioSel" title="Radio to control (switching is refused while the robot or beacon monitor runs)"></select></div>
+  <div id="freq" class="freq" title="Mouse wheel over a digit to tune it; click to type"></div>
+  <input id="freqInput" class="freq-input" hidden>
+  <div class="mode-badge" id="modeBadge">—</div>
+  <div class="meter">
+    <div class="meter-label" id="meterLabel">S</div>
+    <div class="meter-bar"><div id="meterFill"></div></div>
+    <div class="meter-scale"><span>1</span><span>3</span><span>5</span><span>7</span><span>9</span><span>+20</span><span>+40</span><span>+60</span></div>
+  </div>
+  <div id="txBadge" class="tx-badge">RX</div>
+  <div id="clockBadge" class="clock-badge" title="PC clock">NTP …</div>
+  <div class="listen">
+    <button id="listen" title="Stream the receiver audio to this browser">🔈 Listen</button>
+    <input type="range" id="vol" min="0" max="2" step="0.05" value="1" title="Volume">
+  </div>
+</header>
+
+<main>
+  <div class="col-main">
+  <section class="rf" data-title="Panadapter">
+    <div class="rf-toolbar">
+      <span class="lbl">Span</span>
+      <select id="span">
+        <option value="2500">±2.5k</option><option value="5000">±5k</option>
+        <option value="10000">±10k</option><option value="25000">±25k</option>
+        <option value="50000">±50k</option><option value="100000">±100k</option>
+        <option value="250000">±250k</option><option value="500000">±500k</option>
+      </select>
+      <select id="scopeMode"><option value="center">Center</option><option value="fixed">Fixed</option></select>
+      <select id="scopeSpeed" title="Sweep speed"><option value="fast">Fast</option><option value="mid">Mid</option><option value="slow">Slow</option></select>
+      <span class="lbl">Step</span>
+      <select id="step">
+        <option value="10">10 Hz</option><option value="50">50 Hz</option><option value="100" selected>100 Hz</option>
+        <option value="500">500 Hz</option><option value="1000">1 kHz</option><option value="5000">5 kHz</option>
+        <option value="10000">10 kHz</option>
+      </select>
+      <span class="lbl">Contrast</span><input type="range" id="rfContrast" min="0.5" max="3" step="0.1" value="1.4">
+      <span class="lbl">Floor</span><input type="range" id="rfFloor" min="0" max="80" step="1" value="5">
+      <span class="hint">click = tune · wheel = step</span>
+    </div>
+    <div class="hint rf-note" id="rfNote" hidden></div>
+    <div class="pan-wrap" id="rfWrap">
+      <canvas id="rfSpec"></canvas>
+      <canvas id="rfWf"></canvas>
+      <div class="cursor" id="rfCursor"></div>
+      <div class="rf-axis" id="rfAxis"></div>
+    </div>
+  </section>
+
+
+  <section class="audio" data-title="Audio waterfall">
+    <div class="rf-toolbar">
+      <span class="lbl">Audio 0–4 kHz</span>
+      <span class="lbl">Click sets</span>
+      <select id="clickTarget"><option value="cw">CW decoder</option><option value="rtty">RTTY decoder</option></select>
+      <label class="chk"><input type="checkbox" id="snap" checked> snap to peak</label>
+      <span class="lbl">Contrast</span><input type="range" id="afContrast" min="0.3" max="3" step="0.1" value="1.2">
+      <span id="audioStatus" class="hint"></span>
+    </div>
+    <div class="pan-wrap audio-wrap" id="afWrap">
+      <canvas id="afWf"></canvas>
+      <div class="marker cw" id="mkCw"><span>CW</span></div>
+      <div class="marker rtty" id="mkMark"><span>M</span></div>
+      <div class="marker rtty" id="mkSpace"><span>S</span></div>
+      <div class="ft8marks" id="ft8marks"></div>
+      <div class="cursor" id="afCursor"></div>
+      <div class="rf-axis" id="afAxis"></div>
+    </div>
+  </section>
+
+  <section class="decoders" data-title="Decoders">
+    <div class="dec">
+      <div class="dec-head">
+        <label class="chk"><input type="checkbox" id="enCw"> <b>CW</b></label>
+        <span id="cwInfo" class="hint"></span>
+        <label class="chk hint" title="Squelch: signal must be this many times above the noise">SQL <input type="range" id="cwSql" min="2" max="20" step="0.5" value="6" style="width:70px"></label>
+        <button class="small" data-clear="cwOut">Clear</button>
+      </div>
+      <div class="dec-out" id="cwOut"></div>
+    </div>
+    <div class="dec">
+      <div class="dec-head">
+        <label class="chk"><input type="checkbox" id="enRtty"> <b>RTTY</b></label>
+        <span id="rttyInfo" class="hint"></span>
+        <label class="chk"><input type="checkbox" id="rttyRev"> rev</label>
+        <button class="small" data-clear="rttyOut">Clear</button>
+      </div>
+      <div class="dec-out" id="rttyOut"></div>
+    </div>
+    <div class="dec ft8">
+      <div class="dec-head">
+        <label class="chk"><input type="checkbox" id="enFt8"> <b id="ft8Name">FT8</b></label>
+        <label class="chk"><input type="checkbox" id="ft4"> FT4</label>
+        <button class="small" id="ft8Go" title="Set USB-D on this band's FT8 frequency and enable the decoder">Go to FT8 freq</button>
+        <input id="mycall" class="mycall" placeholder="My call">
+        <span id="ft8Info" class="hint"></span>
+        <button class="small" data-clear="ft8Body">Clear</button>
+      </div>
+      <div class="dec-out table">
+        <table><thead><tr><th>UTC</th><th>Str</th><th>DT</th><th>Hz</th><th>Message</th></tr></thead>
+        <tbody id="ft8Body"></tbody></table>
+      </div>
+    </div>
+  </section>
+
+  <section class="spots" data-title="CW Spots">
+    <div class="dec-head">
+      <b>CW Spots</b>
+      <select id="spBand" title="Band"></select>
+      <select id="spAge" title="Spotted within">
+        <option value="300">5 min</option><option value="900" selected>15 min</option>
+        <option value="1800">30 min</option><option value="3600">1 hour</option>
+      </select>
+      <button class="small" id="spRefresh">Refresh</button>
+      <span id="spInfo" class="hint"></span>
+    </div>
+    <div class="dec-out table spots-table">
+      <table><thead><tr><th>Age</th><th>kHz</th><th>Call</th><th>WPM</th><th>SNR</th><th>Spots</th><th>km</th><th>Path</th><th>Country</th><th>Info</th></tr></thead>
+      <tbody id="spBody"></tbody></table>
+    </div>
+  </section>
+
+  <section class="beacons" data-title="NCDXF Beacons">
+    <div class="dec-head">
+      <b>NCDXF Beacons</b>
+      <select id="bnMode" title="What the radio listens to">
+        <option value="cycle">Cycle all bands (all 90 in 15 min)</option>
+        <option value="band">One band (all 18 in 3 min)</option>
+        <option value="follow">Follow one beacon</option>
+      </select>
+      <select id="bnBand" title="Band for One band"></select>
+      <select id="bnBeacon" title="Beacon for Follow"></select>
+      <button class="small" id="bnStart">Start</button>
+      <button class="small" id="bnStop">Stop</button>
+      <span id="bnInfo" class="hint"></span>
+    </div>
+    <div class="dec-out table bn-table">
+      <table><thead><tr id="bnHead"></tr></thead><tbody id="bnBody"></tbody></table>
+    </div>
+    <div class="hint bn-help">Bars: dashes heard at 100 W / 10 W / 1 W / 0.1 W; number: S/N of the 100 W dash (dB, 30 Hz).
+      Hover a cell for details. Dim = older than 15 min. Receive only; while running the radio is in CW with filter FIL2 (500 Hz) and retuned every 10 s;
+      frequency, mode and filter are restored on Stop.</div>
+  </section>
+
+  <section class="pathcheck" data-title="Path check">
+    <div class="dec-head">
+      <b>Path check</b> <span id="pcInfo" class="hint">not run yet - use the Path check button in the robot panel</span>
+    </div>
+    <div class="dec-out table pc-table" id="pcWrap" hidden>
+      <table><thead><tr><th>Receiver</th><th>Heard via</th><th>Country</th><th>Grid</th><th>km</th><th>Brg</th><th>SNR</th><th>kHz</th><th>UTC</th></tr></thead>
+      <tbody id="pcBody"></tbody></table>
+    </div>
+  </section>
+
+  <section class="robot" data-title="CW Robot">
+    <div class="robot-head">
+      <b>CW Robot</b>
+      <span class="hint">gpt-oss via llama.cpp</span>
+      <span id="robotState" class="robot-state">idle</span>
+    </div>
+    <div class="robot-grid">
+      <div class="robot-cfg">
+        <div class="stations">
+          <fieldset class="station">
+            <legend>My station</legend>
+            <label>My call <input id="rbCall" placeholder="N0CALL"></label>
+            <label>My name <input id="rbName" placeholder="JOHN"></label>
+            <label>My QTH <input id="rbQth" placeholder="CITY"></label>
+            <label>My grid <input id="rbGrid" placeholder="MK82 (optional)"></label>
+            <label>Send WPM <input id="rbWpm" type="number" min="8" max="40" value="20"></label>
+            <label>Max CQs <input id="rbMaxCq" type="number" min="1" max="30" value="6"></label>
+          </fieldset>
+          <fieldset class="station other">
+            <legend>Other station <span id="obState" class="hint">no contact</span></legend>
+            <label>Call <input id="rbTarget" placeholder="to answer"><span class="src" id="src_call"></span></label>
+            <label>RST sent <input id="obRstSent" placeholder="auto"><span class="src" id="src_rst_sent"></span></label>
+            <label>RST rcvd <input id="obRstRcvd" placeholder="decoded"><span class="src" id="src_rst_rcvd"></span></label>
+            <label>Name <input id="obName" placeholder="decoded"><span class="src" id="src_name"></span></label>
+            <label>QTH <input id="obQth" placeholder="decoded"><span class="src" id="src_qth"></span></label>
+            <div class="hint ob-help">Filled from the decoder during a contact. Type to correct; your value is kept.</div>
+          </fieldset>
+        </div>
+        <div class="btns">
+          <label class="chk"><input type="checkbox" id="rbAfc" checked> AFC</label>
+          <label class="chk dry"><input type="checkbox" id="rbDry" checked> Dry run (don't transmit)</label>
+        </div>
+        <div class="btns">
+          <button id="rbCq">Call CQ</button>
+          <button id="rbPath" title="QRL?, then 3 CQs; shows who heard you (RBN + PSKReporter)">Path check</button>
+          <button id="rbAnswer" title="Call the station in Other station / Call">Answer</button>
+          <button id="rbHunt" title="Listen on this frequency and answer the first CQ (skips CQ DX from your own country, CQ EU etc. not meant for you); up to 30 min">Hunt</button>
+          <select id="rbHuntWho" title="Which CQ callers Hunt answers"><option value="all">All stations</option><option value="dx">DX only</option></select>
+          <button id="rbStop" class="danger on">STOP</button>
+        </div>
+        <div class="cwsend">
+          <input id="rbInject" placeholder="Simulate received CW (testing)">
+          <button id="rbInjectBtn">Inject RX</button>
+        </div>
+      </div>
+      <div class="dec-out robot-log" id="rbLog"></div>
+    </div>
+  </section>
+  </div>
+
+  <section class="controls" data-title="Controls">
+    <div class="group">
+      <div class="gtitle">Band</div>
+      <div class="btns" id="bands"></div>
+    </div>
+    <div class="group">
+      <div class="gtitle">Mode</div>
+      <div class="btns" id="modes"></div>
+      <div class="btns" id="filters"></div>
+    </div>
+    <div class="group">
+      <div class="gtitle">Receive</div>
+      <div class="btns">
+        <button id="preamp">P.AMP OFF</button>
+        <button id="att">ATT</button>
+        <button id="nb">NB</button>
+        <button id="nr">NR</button>
+        <button id="agc">AGC</button>
+      </div>
+      <label class="slider">AF <input type="range" id="af" min="0" max="255"><span id="afV"></span></label>
+      <label class="slider">RF <input type="range" id="rf" min="0" max="255"><span id="rfV"></span></label>
+    </div>
+    <div class="group tx">
+      <div class="gtitle">Transmit</div>
+      <label class="slider">PWR <input type="range" id="power" min="0" max="255"><span id="powerV"></span></label>
+      <label class="slider">WPM <input type="range" id="keyspeed" min="0" max="255"><span id="keyspeedV"></span></label>
+      <div class="btns">
+        <button id="ptt" class="danger">PTT</button>
+        <button id="tune">TUNE</button>
+      </div>
+      <div class="cwsend">
+        <input id="cwText" placeholder="CW to send (radio keyer, CW mode)" maxlength="120">
+        <button id="cwSend">Send</button><button id="cwStop">Stop</button>
+      </div>
+      <div class="macros" id="macros"></div>
+    </div>
+  </section>
+</main>
+<div id="toast"></div>
+<script src="/static/app.js"></script>
+</body>
+</html>
