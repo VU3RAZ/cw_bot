@@ -110,6 +110,37 @@ Makes a complete CW contact by itself using the local gpt-oss model on llama.cpp
 - Log: `logs/cw_robot.txt` (each contact with full transcript) and `logs/cw_robot.adi`
   (ADIF, contacts where reports were exchanged). Dry runs go to `logs/cw_robot_dryrun.*`.
 
+## Real CW traffic and decoder tuning
+The CW decoder is tuned on real signals recorded from public KiwiSDRs, never from your own radio.
+Retune it whenever the decoder changes or copy looks worse than it should:
+
+```sh
+python3 kiwi.py europe                          # usable KiwiSDRs in a region, best first
+python3 corpus.py capture --call N0CALL --minutes 60
+python3 corpus.py stats                         # how much audio / readable copy there is
+python3 cwtune.py --dry-run                     # search and report; drop --dry-run to save
+```
+
+- **Receivers** come from ReceiverBook's public KiwiSDR list (cached a day in `logs/kiwi_receivers.json`). They are ranked
+  by spare slots, no time limit, then HF SNR. Regions: europe (densest CW traffic, default), na-east, japan, india, oceania.
+  `--kiwi host:port` uses one receiver. A KiwiSDR allows **one connection per IP**: close its browser tab first.
+- **Stations**: capture listens to stations that **RBN spotters within 800 km of the receiver** hear loudly. The RBN login
+  needs `--call`. That is measured evidence they are readable there; worldwide spotter counts are not. Without one it
+  falls back to DX-cluster spots within 3000 km. It stays 8 min per frequency (2 min if nothing readable comes through),
+  listens in a 300-2700 Hz passband and follows the strongest keyed tone.
+- **Corpus**, in `logs/corpus/`: `audio/*.raw` (12 kHz mono s16le) and a `.json` per recording (receiver, dial, target
+  spot, pitch track), plus `copy-*.jsonl` with the decoded copy. Raw audio is about 86 MB per hour.
+- **Tuning** (`cwtune.py`): it fits the tone filter width, squelch, key hysteresis and dash/character/word gap lengths
+  by replaying the recorded audio.
+  - Copy is scored for readability: QSO words, valid calls and reports count; `*` characters and merged words cost.
+  - Overs you type into `logs/corpus/labels.jsonl` (`{"audio", "start_s", "end_s", "text"}`) are scored by exact
+    words and count most.
+  - A result is saved to `decoder_params.json` only if it scores better, the synthetic suite is no worse, and
+    `tests/` passes. The tests guard short word spacing, for example.
+  - Restart the server to use the new values.
+- `kiwiclient` (github.com/jks-prv/kiwiclient) is cloned into `vendor/` on first use.
+- Tests: `python3 -m pytest -q tests`. Synthetic CW comes from `cwsynth.py`.
+
 Files: `radio.py` (IC-7300 CI-V), `ftdx10.py` (FTDX10 CAT), `rig.py` (radio detection, port + audio pairing), `clock.py` (NTP check), `decoders.py` (DSP), `robot.py` (CW robot), `spots.py` (DX spots),
-`pathcheck.py` (who heard us), `beacons.py` (NCDXF beacon monitor), `beaconlog.py` + `spaceweather.py` (its JSONL propagation log), `geo.py` (cty.dat prefixes, grid/distance; `vendor/cty.dat`), `server.py`
+`pathcheck.py` (who heard us), `beacons.py` (NCDXF beacon monitor), `beaconlog.py` + `spaceweather.py` (its JSONL propagation log), `geo.py` (cty.dat prefixes, grid/distance; `vendor/cty.dat`), `cwparse.py` (rule-based over reader), `kiwi.py` + `corpus.py` + `cwtune.py` (KiwiSDR capture and decoder tuning), `server.py`
 (aiohttp + websocket), `static/` (UI).

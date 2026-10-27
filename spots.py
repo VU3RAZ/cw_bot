@@ -191,5 +191,30 @@ class Spots:
             out.append(e)
         return out
 
+    def heard_near(self, loc, radius_km=800, bands=None, max_age=600):
+        """CW stations that RBN spotters within radius_km of loc heard recently, loudest
+        first: [{call, khz, band, snr, wpm, spotters, spotter_km, ts}]. A spotter near a
+        receiver hearing a station well is measured evidence it is readable there, which
+        worldwide spotter counts are not."""
+        cutoff, best = time.time() - max_age, {}
+        for s in self.rbn.spots:
+            b = band_of(s["khz"])
+            if s["ts"] < cutoff or not b or (bands and b not in bands):
+                continue
+            sl = geo.locate(s["spotter"])
+            if not sl:
+                continue
+            km = geo.dist_bearing(loc, sl)[0]
+            if km > radius_km:
+                continue
+            e = best.setdefault((s["call"], b), {"call": s["call"], "band": b, "snr": -99, "spotters": set()})
+            e["spotters"].add(s["spotter"])
+            if s["snr"] >= e["snr"]:
+                e.update(khz=s["khz"], snr=s["snr"], wpm=s["wpm"], spotter_km=round(km), ts=s["ts"])
+        out = sorted(best.values(), key=lambda e: -e["snr"])
+        for e in out:
+            e["spotters"] = len(e["spotters"])
+        return out
+
     def status(self):
         return {"rbn": self.rbn.status(), "errors": self.errors}

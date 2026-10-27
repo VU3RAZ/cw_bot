@@ -1,8 +1,9 @@
 # station data and local settings
 logs/
 settings.json
-# fetched at run time (run.sh clones/builds ft8_lib, geo.py downloads cty.dat)
+# fetched at run time (run.sh clones/builds ft8_lib, geo.py downloads cty.dat, kiwi.py clones kiwiclient)
 vendor/ft8_lib/
 vendor/cty.dat
+vendor/kiwiclient/
 __pycache__/
 *.pyc

@@ -2,6 +2,7 @@
 
 All decoders take float32 mono samples at FS (12 kHz) via feed().
 """
+import json
 import os
 import subprocess
 import tempfile
@@ -14,6 +15,7 @@ from scipy import signal
 FS = 12000
 HERE = os.path.dirname(os.path.abspath(__file__))
 FT8_BIN = os.path.join(HERE, "vendor", "ft8_lib", "decode_ft8")
+CW_PARAMS = os.environ.get("CW_DECODER_PARAMS") or os.path.join(HERE, "decoder_params.json")  # cwtune.py
 
 
 # ---------------------------------------------------------------- spectrum
@@ -86,10 +88,37 @@ MORSE = {
 
 class CWDecoder:
     DECIM = 60          # envelope at 200 Hz -> 5 ms resolution
+    # Tunable (cwtune.py fits them to real KiwiSDR audio and saves decoder_params.json):
+    BANDWIDTH = 100.0   # tone filter width, Hz
+    SQUELCH = 6.0       # required peak/noise ratio before keying
+    KEY_ON, KEY_OFF = 0.55, 0.40    # key thresholds between noise floor and peak (hysteresis)
+    DASH = 2.0          # marks longer than this many dots are dashes
+    CHAR_GAP = 2.5      # silence (in dots) that ends a character
+    WORD_GAP_DEFAULT = 4.0  # silence (in dots) that ends a word, until the sender's spacing is learnt
+    MIN_WORD_GAP, WORD_GAP = 3.4, 6.0   # limits of the learnt threshold
+    TUNABLE = ("BANDWIDTH", "SQUELCH", "KEY_ON", "KEY_OFF", "DASH", "CHAR_GAP", "WORD_GAP_DEFAULT",
+               "MIN_WORD_GAP", "WORD_GAP")
 
-    def __init__(self, freq=700.0, bandwidth=100.0, squelch=6.0):
-        self.bandwidth = bandwidth
-        self.squelch = squelch      # required peak/noise ratio before keying
+    @classmethod
+    def params(cls):
+        return {k: getattr(cls, k) for k in cls.TUNABLE}
+
+    @classmethod
+    def load_params(cls, path=CW_PARAMS):
+        """Apply tuned values from decoder_params.json ({"params": {...}}) if it exists."""
+        try:
+            with open(path) as f:
+                p = json.load(f)["params"]
+        except (OSError, ValueError, KeyError):
+            return {}
+        for k, v in p.items():
+            if k in cls.TUNABLE:
+                setattr(cls, k, float(v))
+        return p
+
+    def __init__(self, freq=700.0, bandwidth=None, squelch=None):
+        self.bandwidth = bandwidth or self.BANDWIDTH
+        self.squelch = squelch or self.SQUELCH
         self.set_freq(freq)
         self.dot = 0.060 * 200      # dot length in envelope samples (20 WPM)
         self.noise = 1.0    # starts high, falls quickly to the real floor
@@ -99,6 +128,8 @@ class CWDecoder:
         self.symbol = ""
         self.word_sent = True
         self.phase_acc = np.zeros(0, np.float32)
+        self.gaps = []              # recent gaps longer than 2 dots (in dots), for word_gap
+        self.word_gap = self.WORD_GAP_DEFAULT
 
     def set_freq(self, freq):
         self.freq = float(freq)
@@ -129,8 +160,8 @@ class CWDecoder:
                 rate = 0.2 if self.noise > 4 * v else 0.02
                 self.noise += rate * (v - self.noise)
             snr_ok = self.peak > self.squelch * self.noise
-            hi = self.noise + 0.55 * (self.peak - self.noise)
-            lo = self.noise + 0.40 * (self.peak - self.noise)
+            hi = self.noise + self.KEY_ON * (self.peak - self.noise)
+            lo = self.noise + self.KEY_OFF * (self.peak - self.noise)
             key = snr_ok and (v > hi or (self.key and v > lo))
             if key == self.key:
                 self.run += 1
@@ -139,6 +170,8 @@ class CWDecoder:
                 continue
             if self.key:
                 self._mark_done(self.run)
+            elif self.run > 2 * self.dot:
+                self._learn_gap(self.run / self.dot)
             self.key = key
             self.run = 1
         return "".join(out)
@@ -146,7 +179,7 @@ class CWDecoder:
     def _mark_done(self, n):
         if n < 0.3 * self.dot:      # glitch
             return
-        if n < 2 * self.dot:
+        if n < self.DASH * self.dot:
             self.symbol += "."
             self.dot = 0.85 * self.dot + 0.15 * n
         else:
@@ -155,19 +188,43 @@ class CWDecoder:
         self.dot = min(max(self.dot, 4), 60)   # 5 ms units: ~60..4 WPM
         self.word_sent = False
 
+    def _learn_gap(self, g):
+        """Fit the word-gap threshold to this sender. Many operators and keyers use word
+        spaces of 4-5 dots, not 7, so a fixed threshold merges their words. The last 30
+        character/word gaps are split into two clusters (2-means) and the threshold goes
+        midway between them."""
+        if g > 15:                  # end of an over, not a word space
+            return
+        self.gaps = (self.gaps + [g])[-30:]
+        lo, hi = min(self.gaps), max(self.gaps)
+        a = b = []
+        for _ in range(8):
+            a = [x for x in self.gaps if abs(x - lo) <= abs(x - hi)]
+            b = [x for x in self.gaps if abs(x - lo) > abs(x - hi)]
+            if not a or not b:
+                break
+            lo, hi = sum(a) / len(a), sum(b) / len(b)
+        if len(a) >= 3 and len(b) >= 2 and hi - lo > 0.7:
+            self.word_gap = min(max((lo + hi) / 2, self.MIN_WORD_GAP), self.WORD_GAP)
+        else:
+            self.word_gap = self.WORD_GAP_DEFAULT
+
     def _gap_tick(self):
         # Called on each silent sample; emit at char/word boundaries exactly once.
-        if self.symbol and self.run == int(2.5 * self.dot):
+        if self.symbol and self.run == int(self.CHAR_GAP * self.dot):
             ch = MORSE.get(self.symbol, "*")
             self.symbol = ""
             return ch
-        if not self.word_sent and not self.symbol and self.run == int(6 * self.dot):
+        if not self.word_sent and not self.symbol and self.run == int(self.word_gap * self.dot):
             self.word_sent = True
             return " "
         return ""
 
     def level(self):
         return float(self.peak / (self.noise + 1e-12))
+
+
+CWDecoder.load_params()
 
 
 # ---------------------------------------------------------------- RTTY
