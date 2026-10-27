@@ -1,0 +1,31 @@
+{
+ "params": {
+  "BANDWIDTH": 100.0,
+  "SQUELCH": 3.0,
+  "SMOOTH": 0.3,
+  "KEY_ON": 0.55,
+  "KEY_OFF": 0.4,
+  "DASH": 2.0,
+  "GLITCH": 0.5,
+  "MAX_WPM": 45,
+  "CHAR_GAP": 2.0,
+  "WORD_GAP_DEFAULT": 4.0,
+  "MIN_WORD_GAP": 3.4,
+  "WORD_GAP": 6.0
+ },
+ "tuned_utc": "2026-10-27T14:40:30+00:00",
+ "corpus_minutes": 41.3,
+ "labelled_overs": 0,
+ "readability_per_min": [
+  4.0,
+  7.1
+ ],
+ "label_accuracy": [
+  null,
+  null
+ ],
+ "synthetic_accuracy": [
+  0.767,
+  0.817
+ ]
+}

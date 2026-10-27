@@ -5,11 +5,13 @@
   python3 cwtune.py --score    score the current parameters only
 
 The decoder is rule-based, so "learning" means fitting its thresholds (tone filter
-width, squelch, key hysteresis, dash/character/word gap lengths) to real signals.
+width, squelch, envelope smoothing, glitch length, key hysteresis, dash/character/word
+gap lengths) to real signals.
 Without labels, decoded copy is scored for readability: known QSO words, valid
 callsigns and reports score their length; '*' (unknown character) and unknown words
 (often two merged words) cost. Overs typed in by hand in logs/corpus/labels.jsonl
-({"audio": name.raw, "start_s", "end_s", "text"}) are scored by exact word matches
+({"audio": name.raw, "start_s", "end_s", "text"}, seconds into the recording) are scored by
+exact word matches
 and count most. A change is kept only if the synthetic test suite does not get worse.
 """
 import argparse
@@ -33,10 +35,12 @@ from decoders import CW_PARAMS, FS, CWDecoder
 HERE = os.path.dirname(os.path.abspath(__file__))
 
 WINDOW = 6.0                # seconds per pitch measurement
-MAX_MINUTES = 60            # of keyed audio used per run (newest recordings first)
+MAX_MINUTES = 60            # of recorded audio used per run (newest recordings first)
 SEARCH = {                  # candidate values per parameter (coordinate descent)
     "BANDWIDTH": [60, 80, 100, 130, 160],
-    "SQUELCH": [3, 4, 5, 6, 8],
+    "SQUELCH": [2.5, 3, 4, 5, 6],
+    "SMOOTH": [0.2, 0.3, 0.4, 0.5],
+    "GLITCH": [0.35, 0.5, 0.65],
     "KEY_ON": [0.45, 0.5, 0.55, 0.6, 0.65],
     "KEY_OFF": [0.3, 0.35, 0.4, 0.45],
     "DASH": [1.7, 1.85, 2.0, 2.2],
@@ -48,34 +52,40 @@ SYNTH_TEXT = ("CQ CQ DE DL3YEE DL3YEE K N0CALL DE UA7N GM TNX CALL UR RST 579 57
               "QTH ROSTOV ROSTOV HW KN R TNX FER RPT 73 GL SK")
 
 
-def segments(max_minutes=MAX_MINUTES):
-    """[(name, start_s, samples, pitch_hz)]: stretches of recordings where one keyed tone
-    stands out (contrast >= MIN_CONTRAST), newest recordings first."""
+def recordings(max_minutes=MAX_MINUTES):
+    """[(name, samples, plan)] for recordings that contain a keyed signal, newest first.
+    plan is [(sample index, pitch Hz)]: where the strongest keyed tone (contrast >=
+    MIN_CONTRAST) moves, measured per WINDOW, like the live capture's retuning."""
     out, total = [], 0.0
     for raw in sorted(glob.glob(os.path.join(AUDIO, "*.raw")), reverse=True):
         x = np.fromfile(raw, "<i2").astype(np.float32) / 32768
         w = int(WINDOW * FS)
-        cur = None
+        plan = []
         for i in range(0, len(x) - w + 1, w):
             hz, c = keyed_peak(x[i:i + w])
-            if c >= MIN_CONTRAST and cur and abs(hz - cur[3]) <= 30:
-                cur[2] = i + w
-                continue
-            if cur:
-                out.append(cur)
-            cur = [os.path.basename(raw), i, i + w, hz] if c >= MIN_CONTRAST else None
-        if cur:
-            out.append(cur)
-        total = sum(e - s for _, s, e, _ in out) / FS / 60
+            if c >= MIN_CONTRAST and (not plan or abs(hz - plan[-1][1]) > 15):
+                plan.append((i, hz))
+        if plan:
+            out.append((os.path.basename(raw), x, plan))
+            total += len(x) / FS / 60
         if total >= max_minutes:
             break
-    audio_cache = {}
-    segs = []
-    for name, s, e, hz in out:
-        if name not in audio_cache:
-            audio_cache[name] = np.fromfile(os.path.join(AUDIO, name), "<i2").astype(np.float32) / 32768
-        segs.append((name, s / FS, audio_cache[name][s:e], hz))
-    return segs
+    return out
+
+
+def replay(x, plan, block=600):
+    """Decode a whole recording with one decoder that follows the plan's pitch.
+    Returns [(seconds, text)] per block that printed something."""
+    dec, out, k = CWDecoder(plan[0][1]), [], 1
+    for i in range(0, len(x), block):
+        while k < len(plan) and plan[k][0] <= i:
+            hz = plan[k][1]
+            dec.retune(hz) if abs(hz - dec.freq) <= 50 else dec.set_freq(hz)
+            k += 1
+        txt = dec.feed(x[i:i + block])
+        if txt:
+            out.append((i / FS, txt))
+    return out
 
 
 def labels():
@@ -106,24 +116,25 @@ def decode(x, hz):
     return cwsynth.decode(CWDecoder(hz), x)
 
 
-def evaluate(segs, labs):
-    """(label word accuracy or None, readability per minute of keyed audio)."""
-    read = sum(readability(decode(x, hz)) for _, _, x, hz in segs)
-    minutes = sum(len(x) for _, _, x, _ in segs) / FS / 60 or 1
-    acc = None
-    if labs:
-        ok = tot = 0
+FLOOR = -5.0                # per-minute floor for one recording's readability
+
+
+def evaluate(recs, labs):
+    """(label word accuracy or None, mean readability per minute over recordings).
+    Everything the decoder prints counts, so junk between signals costs as well as
+    missed copy; each recording's rate is floored at FLOOR so one unreadable pileup
+    can't outweigh the readable QSOs."""
+    rates, ok, tot = [], 0, 0
+    for name, x, plan in recs:
+        chunks = replay(x, plan)
+        r = readability("".join(t for _, t in chunks)) / (len(x) / FS / 60)
+        rates.append(max(r, FLOOR))
         for lab in labs:
-            seg = [(n, s, x, hz) for n, s, x, hz in segs if n == lab["audio"]
-                   and s <= lab["start_s"] and lab["end_s"] <= s + len(x) / FS]
-            if not seg:
-                continue
-            n, s, x, hz = seg[0]
-            part = x[int((lab["start_s"] - s) * FS):int((lab["end_s"] - s) * FS)]
-            o, t = cwsynth.word_score(lab["text"], decode(part, hz))
-            ok, tot = ok + o, tot + t
-        acc = ok / tot if tot else None
-    return acc, read / minutes
+            if lab["audio"] == name:
+                got = "".join(t for ts, t in chunks if lab["start_s"] <= ts <= lab["end_s"] + 1)
+                o, t = cwsynth.word_score(lab["text"], got)
+                ok, tot = ok + o, tot + t
+    return (ok / tot if tot else None), (sum(rates) / len(rates) if rates else 0.0)
 
 
 def synthetic():
@@ -168,9 +179,9 @@ def main():
     ap.add_argument("--minutes", type=float, default=MAX_MINUTES)
     a = ap.parse_args()
     t0 = time.time()
-    segs, labs = segments(a.minutes), labels()
-    minutes = sum(len(x) for _, _, x, _ in segs) / FS / 60
-    print(f"{len(segs)} keyed segments, {minutes:.1f} min of audio; {len(labs)} labelled overs")
+    segs, labs = recordings(a.minutes), labels()
+    minutes = sum(len(x) for _, x, _ in segs) / FS / 60
+    print(f"{len(segs)} recordings with keyed signals, {minutes:.1f} min of audio; {len(labs)} labelled overs")
     if minutes < 3:
         raise SystemExit("too little keyed audio: run  corpus.py capture  first")
     start = CWDecoder.params()
@@ -191,29 +202,23 @@ def main():
                     continue
                 apply(trial)
                 o = objective(*evaluate(segs, labs))
-                if o > best_obj * 1.002:            # ignore noise-level gains
+                if o > best_obj + max(0.02, abs(best_obj) * 0.002):   # ignore noise-level gains
                     best, best_obj, improved = trial, o, True
                     print(f"  round {rnd + 1}: {k} = {v} -> objective {o:.1f}")
             apply(best)
         if not improved:
             break
-    # The test suite (word spacing for short-spacing senders, parser cases) must still
-    # pass: a small corpus from a few operators can pull a threshold too far. Revert
-    # changes one by one until it does, keeping the best-scoring passing set.
-    if best != start and not tests_pass(best):
-        print("  tuned set fails tests/: trying with single changes reverted")
+    # The test suite (word spacing for short-spacing senders, weak signals, noise junk,
+    # parser cases) must still pass: a corpus from a few operators can pull thresholds
+    # too far. Greedily revert the change whose loss costs least until it does.
+    while best != start and not tests_pass(best):
         options = []
         for k in [k for k in best if best[k] != start[k]]:
             trial = dict(best, **{k: start[k]})
-            if tests_pass(trial):
-                apply(trial)
-                options.append((objective(*evaluate(segs, labs)), k, trial))
-        if options:
-            o, k, best = max(options, key=lambda t: t[0])
-            print(f"  reverted {k}: objective {o:.1f}")
-        else:
-            print("  no passing variant: keeping current parameters")
-            best = dict(start)
+            apply(trial)
+            options.append((objective(*evaluate(segs, labs)), k, trial))
+        o, k, best = max(options, key=lambda t: t[0])
+        print(f"  fails tests/: reverting {k} -> objective {o:.1f}")
     apply(best)
     acc1, read1 = evaluate(segs, labs)
     syn1 = synthetic()

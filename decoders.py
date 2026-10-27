@@ -90,13 +90,16 @@ class CWDecoder:
     DECIM = 60          # envelope at 200 Hz -> 5 ms resolution
     # Tunable (cwtune.py fits them to real KiwiSDR audio and saves decoder_params.json):
     BANDWIDTH = 100.0   # tone filter width, Hz
-    SQUELCH = 6.0       # required peak/noise ratio before keying
+    SQUELCH = 3.0       # required peak/noise ratio before keying
+    SMOOTH = 0.3        # envelope moving average, in dots: ~6 dB more sensitivity than none
     KEY_ON, KEY_OFF = 0.55, 0.40    # key thresholds between noise floor and peak (hysteresis)
     DASH = 2.0          # marks longer than this many dots are dashes
+    GLITCH = 0.5        # marks shorter than this fraction of a MAX_WPM dot are noise (QRN, clicks)
+    MAX_WPM = 45        # noise bursts would otherwise drag the speed estimate up to dit-noise
     CHAR_GAP = 2.5      # silence (in dots) that ends a character
     WORD_GAP_DEFAULT = 4.0  # silence (in dots) that ends a word, until the sender's spacing is learnt
     MIN_WORD_GAP, WORD_GAP = 3.4, 6.0   # limits of the learnt threshold
-    TUNABLE = ("BANDWIDTH", "SQUELCH", "KEY_ON", "KEY_OFF", "DASH", "CHAR_GAP", "WORD_GAP_DEFAULT",
+    TUNABLE = ("BANDWIDTH", "SQUELCH", "SMOOTH", "KEY_ON", "KEY_OFF", "DASH", "GLITCH", "MAX_WPM", "CHAR_GAP", "WORD_GAP_DEFAULT",
                "MIN_WORD_GAP", "WORD_GAP")
 
     @classmethod
@@ -129,6 +132,7 @@ class CWDecoder:
         self.word_sent = True
         self.phase_acc = np.zeros(0, np.float32)
         self.gaps = []              # recent gaps longer than 2 dots (in dots), for word_gap
+        self.smooth = []            # last envelope samples, for the moving average
         self.word_gap = self.WORD_GAP_DEFAULT
 
     def set_freq(self, freq):
@@ -154,6 +158,11 @@ class CWDecoder:
         self.phase_acc = self.phase_acc[n * self.DECIM:]
         out = []
         for v in e:
+            # Average over a fraction of a dot: noise spikes are much shorter than a
+            # dot, so this lifts weak signals out of the noise without blurring timing.
+            self.smooth.append(v)
+            del self.smooth[:-max(1, round(self.SMOOTH * self.dot))]
+            v = sum(self.smooth) / len(self.smooth)
             # Fast-attack/slow-decay peak; noise floor = running mean while key-up.
             self.peak = max(v, self.peak * 0.995)
             if not self.key:
@@ -177,7 +186,7 @@ class CWDecoder:
         return "".join(out)
 
     def _mark_done(self, n):
-        if n < 0.3 * self.dot:      # glitch
+        if n < self.GLITCH * 240 / self.MAX_WPM:    # fixed, so a fast sender's first dots count
             return
         if n < self.DASH * self.dot:
             self.symbol += "."
@@ -185,7 +194,7 @@ class CWDecoder:
         else:
             self.symbol += "-"
             self.dot = 0.85 * self.dot + 0.15 * (n / 3)
-        self.dot = min(max(self.dot, 4), 60)   # 5 ms units: ~60..4 WPM
+        self.dot = min(max(self.dot, 240 / self.MAX_WPM), 60)   # 5 ms units; slowest 4 WPM
         self.word_sent = False
 
     def _learn_gap(self, g):

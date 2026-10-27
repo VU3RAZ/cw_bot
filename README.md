@@ -130,7 +130,7 @@ python3 cwtune.py --dry-run                     # search and report; drop --dry-
   listens in a 300-2700 Hz passband and follows the strongest keyed tone.
 - **Corpus**, in `logs/corpus/`: `audio/*.raw` (12 kHz mono s16le) and a `.json` per recording (receiver, dial, target
   spot, pitch track), plus `copy-*.jsonl` with the decoded copy. Raw audio is about 86 MB per hour.
-- **Tuning** (`cwtune.py`): it fits the tone filter width, squelch, key hysteresis and dash/character/word gap lengths
+- **Tuning** (`cwtune.py`): it fits the tone filter width, squelch, envelope smoothing, glitch length, key hysteresis and dash/character/word gap lengths
   by replaying the recorded audio.
   - Copy is scored for readability: QSO words, valid calls and reports count; `*` characters and merged words cost.
   - Overs you type into `logs/corpus/labels.jsonl` (`{"audio", "start_s", "end_s", "text"}`) are scored by exact
