@@ -24,6 +24,7 @@ function connect() {
     else if (m.type === 'state') { Object.assign(state, m.state); renderState(m.state); if (m.state.freq) spotsBandCheck(); }
     else if (m.type === 'decoder') { dec = m.status; renderDecoder(); }
     else if (m.type === 'cw') { appendText('cwOut', m.text); $('cwInfo').textContent = `${dec.cw_freq.toFixed(0)} Hz · ${m.wpm} WPM`; }
+    else if (m.type === 'cw2') { appendText('cw2Out', m.text); $('cw2Info').textContent = `${m.wpm} WPM`; }
     else if (m.type === 'rtty') appendText('rttyOut', m.text);
     else if (m.type === 'ft8') onFt8(m);
     else if (m.type === 'robot') renderRobot(m.status);
@@ -432,9 +433,11 @@ function renderDecoder() {
   $('enCw').checked = dec.enabled.cw; $('enRtty').checked = dec.enabled.rtty; $('enFt8').checked = dec.enabled.ft8;
   $('ft4').checked = dec.ft4; $('ft8Name').textContent = dec.ft4 ? 'FT4' : 'FT8';
   $('cwSql').value = dec.cw_squelch;
+  $('cwEngine').value = dec.cw_engine;
+  $('cw2Box').hidden = dec.cw_engine !== 'both';
   if (state.mode && dec.rtty_mark_high !== (defaultMarkHigh() !== $('rttyRev').checked))
     send({ cmd: 'decoder', rtty_mark_high: defaultMarkHigh() !== $('rttyRev').checked });
-  $('cwInfo').textContent = `${dec.cw_freq.toFixed(0)} Hz · ${dec.cw_wpm} WPM`;
+  $('cwInfo').textContent = `${dec.cw_freq.toFixed(0)} Hz · ${dec.cw_wpm} WPM` + (dec.cw_warning ? ` · ⚠ ${dec.cw_warning}` : '');
   $('rttyInfo').textContent = `${dec.rtty_freq.toFixed(0)} Hz · ${dec.rtty_shift}/${dec.rtty_baud} · mark ${dec.rtty_mark_high ? 'high' : 'low'}`;
   $('audioStatus').textContent = dec.audio ? '' : '⚠ no audio from radio';
   placeMarker($('mkCw'), dec.enabled.cw ? dec.cw_freq : -1);
@@ -447,6 +450,7 @@ const defaultMarkHigh = () => !['LSB', 'RTTY'].includes(state.mode);
 
 $('enCw').onchange = (ev) => send({ cmd: 'decoder', enable: { cw: ev.target.checked } });
 $('cwSql').onchange = (ev) => send({ cmd: 'decoder', cw_squelch: +ev.target.value });
+$('cwEngine').onchange = (ev) => send({ cmd: 'decoder', cw_engine: ev.target.value });
 $('enRtty').onchange = (ev) => send({ cmd: 'decoder', enable: { rtty: ev.target.checked }, rtty_mark_high: defaultMarkHigh() !== $('rttyRev').checked });
 $('rttyRev').checked = lsGet('rttyRev', false);
 $('rttyRev').onchange = () => { lsSet('rttyRev', $('rttyRev').checked); send({ cmd: 'decoder', rtty_mark_high: defaultMarkHigh() !== $('rttyRev').checked }); };

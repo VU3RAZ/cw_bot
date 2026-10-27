@@ -95,7 +95,7 @@ class PathCheck:
         self._broadcast()
 
     def _add(self, source, receiver, snr, khz, ts, grid=""):
-        """One row per receiver; many spotters report to both RBN and PSKReporter."""
+        """One row per receiver; many receivers report to both RBN and PSKReporter."""
         r = self.result
         if grid:
             geo.learn_grid(receiver, grid)

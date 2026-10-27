@@ -82,11 +82,18 @@
     <div class="dec">
       <div class="dec-head">
         <label class="chk"><input type="checkbox" id="enCw"> <b>CW</b></label>
+        <select id="cwEngine" class="small" title="CW decoder: Std = threshold decoder, HMM = statistical decoder (~2 s later), Both = Std copy with the HMM's copy underneath, same audio">
+          <option value="standard">Std</option><option value="hmm">HMM</option><option value="both">Both</option>
+        </select>
         <span id="cwInfo" class="hint"></span>
         <label class="chk hint" title="Squelch: signal must be this many times above the noise">SQL <input type="range" id="cwSql" min="2" max="20" step="0.5" value="6" style="width:70px"></label>
         <button class="small" data-clear="cwOut">Clear</button>
       </div>
       <div class="dec-out" id="cwOut"></div>
+      <div id="cw2Box" hidden>
+        <div class="dec-head hint">HMM <span id="cw2Info"></span><button class="small" data-clear="cw2Out">Clear</button></div>
+        <div class="dec-out" id="cw2Out"></div>
+      </div>
     </div>
     <div class="dec">
       <div class="dec-head">

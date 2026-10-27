@@ -17,6 +17,7 @@ import numpy as np
 from aiohttp import web, WSMsgType
 
 from decoders import FS, Spectrum, CWDecoder, RTTYDecoder, FT8Decoder
+from cwhmm import CWHmm
 from radio import IC7300
 import rig
 import clock
@@ -46,9 +47,13 @@ class App:
         self.clock = clock.status()     # PC clock vs NTP, rechecked every minute
         self.spectrum = Spectrum()
         self.cw = CWDecoder(600)   # IC-7300 default CW pitch
+        self.cw2 = None            # second CW decoder on the same audio ("both"), follows cw's pitch
+        self.cw_engine = "standard"
+        self.set_cw_engine(rig.load_settings().get("cw_engine", "standard"))
         self.rtty = RTTYDecoder(2210)
         self.ft8 = FT8Decoder()
         self.enabled = {"cw": True, "rtty": False, "ft8": False}
+        self.cw_warning = ""
         self.audio_ok = False
         self.ft8_busy = False
         self.listeners = set()      # websockets that want the receive audio
@@ -84,8 +89,8 @@ class App:
         self.broadcast(struct.pack("<Bii", MSG_SCOPE, lo, hi) + px)
 
     def decoder_status(self):
-        return {"cw_freq": self.cw.freq, "cw_wpm": round(self.cw.wpm, 1),
-                "cw_squelch": self.cw.squelch, "rtty_freq": self.rtty.center, "rtty_mark_high": self.rtty.mark_high,
+        return {"cw_freq": self.cw.freq, "cw_wpm": round(self.cw.wpm, 1), "cw_engine": self.cw_engine,
+                "cw_squelch": self.cw.squelch, "cw_warning": self.cw_warning, "rtty_freq": self.rtty.center, "rtty_mark_high": self.rtty.mark_high,
                 "rtty_shift": self.rtty.shift, "rtty_baud": self.rtty.baud,
                 "ft4": self.ft8.ft4, "enabled": self.enabled, "audio": self.audio_ok}
 
@@ -233,6 +238,12 @@ class App:
             if txt:
                 self.broadcast_json(type="cw", text=txt, wpm=round(self.cw.wpm, 1))
                 self.robot.on_rx(txt)
+            if self.cw2:
+                if self.cw2.freq != self.cw.freq:
+                    self.cw2.retune(self.cw.freq)
+                txt = self.cw2.feed(x)
+                if txt:
+                    self.broadcast_json(type="cw2", text=txt, wpm=round(self.cw2.wpm, 1))
         if self.enabled["rtty"]:
             txt = self.rtty.feed(x)
             if txt:
@@ -351,9 +362,38 @@ class App:
 
     def follow_pitch(self, pitch):
         self.cw.set_freq(pitch)
+        self.cw_warning = ""
         self._send_all(json.dumps({"type": "decoder", "status": self.decoder_status()}))
 
+    def outside_passband(self, f):
+        """In CW mode the radio's IF filter passes only cw_pitch +- if_width/2: a decoder
+        pitch outside it hears filter skirts and noise (copy like 'EE I EE'). Returns
+        the reason to refuse f, or ""."""
+        st = self.radio.state
+        pitch, width = st.get("cw_pitch") or 0, st.get("if_width") or 0
+        if not str(st.get("mode", "")).startswith("CW") or not pitch or not width:
+            return ""
+        half = max(width / 2, 100) + 50        # a little slack for an off-zero-beat signal
+        if abs(f - pitch) <= half:
+            return ""
+        return f"{f:.0f} Hz is outside the CW filter ({pitch - width / 2:.0f}-{pitch + width / 2:.0f} Hz)"
+
+    def set_cw_engine(self, name):
+        """standard / hmm: which decoder copies (and feeds the robot); both: standard,
+        plus the HMM's copy shown alongside on the same audio for comparison."""
+        if name not in ("standard", "hmm", "both"):
+            return
+        make = CWHmm if name == "hmm" else CWDecoder
+        sq = self.cw.squelch                # one SQL slider for whichever decoders run
+        if not isinstance(self.cw, make):
+            self.cw = make(self.cw.freq, squelch=sq)
+        self.cw2 = CWHmm(self.cw.freq, squelch=sq) if name == "both" else None
+        self.cw_engine = name
+
     def set_decoder(self, m):
+        if "cw_engine" in m:
+            self.set_cw_engine(m["cw_engine"])
+            rig.save_settings(cw_engine=self.cw_engine)
         if "enable" in m:
             for k, v in m["enable"].items():
                 if k in self.enabled:
@@ -362,9 +402,13 @@ class App:
             f = float(m["cw_freq"])
             if m.get("snap"):
                 f = self.spectrum.peak_near(f)
-            self.cw.set_freq(f)
+            self.cw_warning = self.outside_passband(f)
+            if not self.cw_warning:
+                self.cw.set_freq(f)
         if "cw_squelch" in m:
-            self.cw.squelch = float(m["cw_squelch"])
+            for d in (self.cw, self.cw2):
+                if d:
+                    d.squelch = float(m["cw_squelch"])
         if "rtty_freq" in m or "rtty_mark_high" in m:
             self.rtty.set_freq(float(m.get("rtty_freq", self.rtty.center)), m.get("rtty_mark_high"))
         if "ft4" in m:

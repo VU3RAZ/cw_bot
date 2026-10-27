@@ -8,6 +8,13 @@ panadapter + waterfall, an audio waterfall, and CW / RTTY / FT8 / FT4 decoding.
 Options: `--serial /dev/ttyUSB0 --baud 115200 --civ 94 --audio <pipewire node> --host 0.0.0.0 --port 8073`
 (serial port and audio device are auto-detected).
 
+To keep it running after the terminal closes, with a memory cap, run it as a systemd user unit:
+
+    systemd-run --user --collect --unit=cw-bot-server -p MemoryMax=4G -p MemorySwapMax=0 \
+      -p WorkingDirectory=$PWD -p StandardOutput=append:$PWD/logs/server.out \
+      -p StandardError=append:$PWD/logs/server.out -E PATH=$PATH $PWD/run.sh
+    systemctl --user restart cw-bot-server      # or stop
+
 ## Radios
 The dropdown at the top left picks the radio: **IC-7300** (CI-V) or **Yaesu FTDX10** (CAT, `ftdx10.py`).
 Radios are **detected by their USB ids** at startup and every 2 s while running (`rig.detect()`): IC-7300 = CP2102
@@ -46,6 +53,12 @@ reference).
 - **Frequency**: mouse wheel over a digit tunes that digit; click it to type (kHz or MHz). Arrow keys step.
 - **Audio waterfall**: click a signal to point the CW (snaps to the peak) or RTTY decoder at it.
 - **CW**: auto speed tracking; raise SQL if it prints noise. Send box uses the radio's keyer (CW mode, break-in on).
+  - The decoder selector picks **Std** (threshold decoder), **HMM** (statistical decoder, better on weak and fast
+    signals, prints about 2 s late) or **Both**, which shows the HMM's copy under the standard copy on the same
+    audio and pitch, for live comparison. The robot uses the HMM only when HMM alone is selected. The choice is saved in `settings.json`.
+  - One SQL slider sets both decoders; their levels are on the same scale (band noise alone reads about 1.5-2.2).
+  - In CW mode a decoder pitch outside the radio's IF filter is refused with a warning next to the WPM readout.
+  - See [docs/cw-decoders.md](docs/cw-decoders.md) for how the decoders work and how they compare.
 - **RTTY**: 45.45 baud / 170 Hz; mark side follows the sideband (LSB/RTTY = mark low), tick *rev* for reversed signals.
 - **FT8/FT4**: "Go to FT8 freq" sets USB-D on the current band's FT8 frequency. Needs the PC clock NTP-synced.
   Decoding uses [ft8_lib](https://github.com/kgoba/ft8_lib); "Str" is ft8_lib's score, not WSJT-X SNR.
@@ -141,6 +154,6 @@ python3 cwtune.py --dry-run                     # search and report; drop --dry-
 - `kiwiclient` (github.com/jks-prv/kiwiclient) is cloned into `vendor/` on first use.
 - Tests: `python3 -m pytest -q tests`. Synthetic CW comes from `cwsynth.py`.
 
-Files: `radio.py` (IC-7300 CI-V), `ftdx10.py` (FTDX10 CAT), `rig.py` (radio detection, port + audio pairing), `clock.py` (NTP check), `decoders.py` (DSP), `robot.py` (CW robot), `spots.py` (DX spots),
+Files: `radio.py` (IC-7300 CI-V), `ftdx10.py` (FTDX10 CAT), `rig.py` (radio detection, port + audio pairing), `clock.py` (NTP check), `decoders.py` (DSP), `cwhmm.py` (HMM CW decoder), `robot.py` (CW robot), `spots.py` (DX spots),
 `pathcheck.py` (who heard us), `beacons.py` (NCDXF beacon monitor), `beaconlog.py` + `spaceweather.py` (its JSONL propagation log), `geo.py` (cty.dat prefixes, grid/distance; `vendor/cty.dat`), `cwparse.py` (rule-based over reader), `kiwi.py` + `corpus.py` + `cwtune.py` (KiwiSDR capture and decoder tuning), `server.py`
 (aiohttp + websocket), `static/` (UI).

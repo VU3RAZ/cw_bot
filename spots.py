@@ -3,7 +3,7 @@
 Three sources, merged per callsign:
 - DX Summit (http://www.dxsummit.fi) JSON API: human DX-cluster spots, no login.
 - HamQTH (https://www.hamqth.com) DX-cluster CSV: human spots, no login.
-- Reverse Beacon Network telnet (telnet.reversebeacon.net:7000): CW spotter spots
+- Reverse Beacon Network telnet (telnet.reversebeacon.net:7000): CW spots from automatic receivers
   with measured SNR and WPM. RBN asks for a callsign at login, so the feed only
   starts once ours is known (set_call).
 """

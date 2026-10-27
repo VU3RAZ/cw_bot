@@ -97,9 +97,10 @@ class CWDecoder:
     GLITCH = 0.5        # marks shorter than this fraction of a MAX_WPM dot are noise (QRN, clicks)
     MAX_WPM = 45        # noise bursts would otherwise drag the speed estimate up to dit-noise
     CHAR_GAP = 2.5      # silence (in dots) that ends a character
+    ELEMENT_GAP = 1.6   # ...or this many of the sender's own element gaps, if sooner
     WORD_GAP_DEFAULT = 4.0  # silence (in dots) that ends a word, until the sender's spacing is learnt
     MIN_WORD_GAP, WORD_GAP = 3.4, 6.0   # limits of the learnt threshold
-    TUNABLE = ("BANDWIDTH", "SQUELCH", "SMOOTH", "KEY_ON", "KEY_OFF", "DASH", "GLITCH", "MAX_WPM", "CHAR_GAP", "WORD_GAP_DEFAULT",
+    TUNABLE = ("BANDWIDTH", "SQUELCH", "SMOOTH", "KEY_ON", "KEY_OFF", "DASH", "GLITCH", "MAX_WPM", "CHAR_GAP", "ELEMENT_GAP", "WORD_GAP_DEFAULT",
                "MIN_WORD_GAP", "WORD_GAP")
 
     @classmethod
@@ -132,6 +133,7 @@ class CWDecoder:
         self.word_sent = True
         self.phase_acc = np.zeros(0, np.float32)
         self.gaps = []              # recent gaps longer than 2 dots (in dots), for word_gap
+        self.egap = self.dot        # the sender's gap between elements of a character
         self.smooth = []            # last envelope samples, for the moving average
         self.word_gap = self.WORD_GAP_DEFAULT
 
@@ -179,6 +181,8 @@ class CWDecoder:
                 continue
             if self.key:
                 self._mark_done(self.run)
+            elif self.run < 1.7 * self.dot:
+                self.egap = 0.25 * self.egap + 0.75 * self.run
             elif self.run > 2 * self.dot:
                 self._learn_gap(self.run / self.dot)
             self.key = key
@@ -188,6 +192,8 @@ class CWDecoder:
     def _mark_done(self, n):
         if n < self.GLITCH * 240 / self.MAX_WPM:    # fixed, so a fast sender's first dots count
             return
+        if self.word_sent and not self.symbol and n < self.dot / 2:
+            return                  # a blip under half a dot before a word: noise, not a dot
         if n < self.DASH * self.dot:
             self.symbol += "."
             self.dot = 0.85 * self.dot + 0.15 * n
@@ -220,7 +226,11 @@ class CWDecoder:
 
     def _gap_tick(self):
         # Called on each silent sample; emit at char/word boundaries exactly once.
-        if self.symbol and self.run == int(self.CHAR_GAP * self.dot):
+        # A character ends after CHAR_GAP dots, or sooner after ELEMENT_GAP of this
+        # sender's element gaps: operators who leave short gaps inside characters often
+        # leave short character gaps too, which a fixed dot multiple merges into '*'.
+        end = min(int(self.CHAR_GAP * self.dot), int(self.ELEMENT_GAP * self.egap) + 1)
+        if self.symbol and self.run == end:
             ch = MORSE.get(self.symbol, "*")
             self.symbol = ""
             return ch
