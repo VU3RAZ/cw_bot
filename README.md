@@ -111,8 +111,11 @@ Makes a complete CW contact by itself using the local gpt-oss model on llama.cpp
   CQ DX from your own country and CQ EU/NA/JA... not meant for you are skipped, as is a station that does not come back.
   The selector next to Hunt picks **All stations** or **DX only** (callers in other countries).
   Only the robot's modes answer: while idle it does not react to anything the decoder prints.
-- The model reads each received over from the CW decoder (who is calling, their RST, name,
-  QTH, repeat requests, 73). The code sends standard messages, handles turn-taking,
+- Each received over is read first by a rule-based reader (`cwparse.py`: who is calling, their RST, name, QTH,
+  repeat requests, 73), which takes well under a millisecond. It handles merged doubles (IGORIGOR) and votes out
+  decoder errors in repeated words. The model is asked only when the reader is unsure, about 5 s per over: a
+  question to answer (RIG? WX?) or many unknown words. If the model is unreachable the reader's result is used.
+  The robot log shows READ for the reader and LLM for the model. The code sends standard messages, handles turn-taking,
   retries (AGN? / QRZ?), ignores overs of another contact on the frequency ("UA7N DE VU2TMP":
   a callsign next to DE that is neither ours nor our partner's), and stops after max CQs, 3 unanswered overs, or 15 minutes.
 - **Dry run** (on by default) goes through the whole contact but never keys the radio;

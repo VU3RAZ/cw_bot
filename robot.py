@@ -17,6 +17,7 @@ import aiohttp
 
 from decoders import MORSE
 from spots import band_of
+import cwparse
 import geo
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -131,8 +132,8 @@ def in_copy(value, over, fuzzy=False):
     if not value:
         return False
     words = over.replace("N", "9").split() if value.isdigit() else over.split()
-    if value in words or (" " in value and value in over):
-        return True
+    if value in words or value * 2 in words or (" " in value and value in over):
+        return True                     # value * 2: merged doubles like IGORIGOR
     return fuzzy and any(close_to(value, w) for w in words if len(w) >= 3)
 
 
@@ -471,9 +472,6 @@ class CWRobot:
             self._event("note", "someone else's CQ - still listening")
             return False
         info = await self._read_over(over)
-        if info is None:          # model unavailable: ask for a repeat rather than guess
-            await self._tx(f"{q['call'] or 'QRZ?'} DE {my} PSE AGN K")
-            return True
         if q["phase"] == "cq" and not (info["for_us"] or my in over):
             return False
 
@@ -526,8 +524,19 @@ class CWRobot:
         return f"{call} DE {my} R TNX FER RPT {op}{extra} 73 GL {call} DE {my} <SK>"
 
     async def _read_over(self, over):
+        """Fields of one received over. The rule-based reader (cwparse) answers at once when
+        the over follows the usual QSO patterns; the LLM is asked only when it is unsure (a
+        question to answer, many unknown words), and its result stands in if the LLM fails."""
         self._set_state("thinking")
         q = self.qso
+        c = self.cfg
+        t = time.time()
+        parsed = cwparse.parse(over, c["mycall"], q["call"], c["name"], c["qth"])
+        fields = {k: parsed[k] for k in SCHEMA["required"]}
+        if parsed["confidence"] == "high":
+            self._event("parse", f"({time.time() - t:.2f}s) " + json.dumps(fields))
+            return fields
+        self._event("parse", f"unsure ({', '.join(parsed['questions'] + parsed['unknown'][:6])}) - asking the LLM")
         user = json.dumps({
             "we_are": self.cfg["mycall"],
             "contact_so_far": {k: q[k] for k in ("call", "rst_rcvd", "name", "qth")},
@@ -541,7 +550,8 @@ class CWRobot:
                 return info
             except Exception as e:
                 self._event("error", f"LLM: {e}")
-        return None
+        self._event("parse", "LLM unavailable - using the rule-based reading: " + json.dumps(fields))
+        return fields
 
     def _system_prompt(self):
         c = self.cfg

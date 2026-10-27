@@ -33,6 +33,14 @@ def close_to(a, b):
     return sum(x != y for x, y in zip(a, b)) + abs(len(a) - len(b)) <= 2
 
 
+def is_ours(w, mine):
+    """Is this name/QTH word our own echoed back? Short words allow one decoder error,
+    not two: with two, BOB would pass for JOE."""
+    if len(max(w, mine, key=len)) > 5:
+        return close_to(w, mine)
+    return abs(len(w) - len(mine)) <= 1 and sum(x != y for x, y in zip(w, mine)) + abs(len(w) - len(mine)) <= 1
+
+
 def is_call(w):
     return bool(CALLSIGN.match(w)) and not RST.match(w) and geo.lookup(w) is not None
 
@@ -165,8 +173,8 @@ def parse(over, mycall, partner="", my_name="", my_qth=""):
 
     name = field_after(words, ("NAME", "OP"), used)
     qth = field_after(words, ("QTH",), used)
-    info["name"] = "" if close_to(name, my_name or "-") else name
-    info["qth"] = "" if close_to(qth, my_qth or "-") else qth
+    info["name"] = "" if is_ours(name, my_name or "-") else name
+    info["qth"] = "" if is_ours(qth, my_qth or "-") else qth
 
     info["asks_repeat"] = any(w in REPEAT_WORDS for w in words) or "PSE RPT" in " ".join(words)
     tail = words[-1:]

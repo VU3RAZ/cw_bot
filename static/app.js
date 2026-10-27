@@ -612,7 +612,7 @@ function robotEvent(m) {
   const el = $('rbLog');
   const div = document.createElement('div');
   div.className = m.kind;
-  const label = { tx: 'TX', rx: 'RX', llm: 'LLM', note: '··', error: 'ERR', log: 'LOG' }[m.kind] || m.kind;
+  const label = { tx: 'TX', rx: 'RX', llm: 'LLM', parse: 'READ', note: '··', error: 'ERR', log: 'LOG' }[m.kind] || m.kind;
   div.textContent = `${m.t} ${label}  ${m.text}`;
   el.appendChild(div);
   while (el.childNodes.length > 500) el.removeChild(el.firstChild);

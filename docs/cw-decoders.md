@@ -73,16 +73,17 @@ Its synthetic results at two settings:
 The real-audio set is 65.7 minutes of KiwiSDR recordings, scored with `cwtune.py`'s readability measure: QSO words
 and valid calls count, `*` and merged words cost. The synthetic tests use `cwsynth.py`.
 
-| | Std | HMM (before the squelch fix) |
-|---|---|---|
-| Real audio, readable words/min | 2.2 | -5.0 (junk between transmissions) |
-| Real audio, good / junk | 510 / 351 | 667 / 2646 |
-| Weak synthetic, 0 / 3 / 6 / 9 dB | 0 / 12 / 99 / 100 % | 41 / 96 / 100 / 100 % |
-| Fast synthetic, 35 / 40 / 44 WPM (words of 23) | 19 / 19 / 19 | 23 / 23 / 23 |
+| | Std (SQL 3.0) | HMM (SQL 2.3) | HMM (SQL 3.0) |
+|---|---|---|---|
+| Real audio, readable words/min | 2.2 | -2.7 | -1.9 |
+| Real audio, good / junk words | 510 / 351 | 473 / 908 | 481 / 828 |
+| Junk on synthetic noise | 0/min | 0/min | 0/min |
+| Weak synthetic, 0 / 3 / 6 / 9 dB | 0 / 12 / 99 / 100 % | 36 / 94 / 100 / 100 % | 0 / 27 / 96 / 99 % |
+| Fast synthetic, 35 / 40 / 44 WPM (words of 23) | 19 / 19 / 19 | 23 / 23 / 23 | 23 / 23 / 23 |
 
-The HMM copies weak and fast signals far better, but it was measured with the squelch that never closed (see above),
-so its junk count isn't valid. Its real-audio figures still have to be re-measured with the fixed squelch. Meanwhile,
-**Both** shows the two decoders side by side on live signals.
+The HMM copies weak and fast synthetic signals far better, but on real recordings it prints more than twice the junk
+(fading, QRM and adjacent signals), so the standard decoder stays the default. Before the squelch fix the HMM scored
+-5.0/min with 2646 junk words. **Both** shows the two side by side on live signals.
 
 ## Testing
 
