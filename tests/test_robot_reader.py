@@ -9,11 +9,15 @@ class Radio:
     state = {"smeter": 100, "mode": "CW", "cw_pitch": 700}
 
 
+from cwparse import OverReader
+
+
 class App:
     radio = Radio()
 
     def __init__(self):
         self.events = []
+        self.overs = OverReader()
 
     def broadcast_json(self, **m):
         if m.get("type") == "robot_event":

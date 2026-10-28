@@ -18,6 +18,7 @@ import aiohttp
 from decoders import MORSE
 from spots import band_of
 import cwparse
+from cwparse import clean_text
 import geo
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -25,7 +26,6 @@ LOG_DIR = os.path.join(HERE, "logs")
 
 MORSE_REV = {v: k for k, v in MORSE.items()}
 QSO_FIELDS = ("call", "rst_sent", "rst_rcvd", "name", "qth")
-ALLOWED = re.compile(r"<(SK|KN|AR|BT)>|[A-Z0-9/?.,= ]")
 CALLSIGN = re.compile(r"^(?=.*\d)[A-Z0-9]{1,3}[0-9][A-Z0-9]{0,4}[A-Z](/[A-Z0-9]{1,4})?$")
 
 SYSTEM_PROMPT = """You read Morse code (CW) copy for amateur radio station {mycall} during a contact.
@@ -83,11 +83,6 @@ def morse_seconds(text, wpm):
             units += sum(1 if e == "." else 3 for e in code) + len(code) - 1 + 3
         units += 4
     return units * 1.2 / max(wpm, 5)
-
-
-def clean_text(text):
-    text = (text or "").upper().replace("<BT>", "=")
-    return re.sub(r"\s+", " ", "".join(m.group(0) for m in ALLOWED.finditer(text))).strip()
 
 
 def meaningful(text):
@@ -257,6 +252,8 @@ class CWRobot:
             raise RuntimeError("stop the beacon monitor first - both need the radio")
         if not self.cfg["dry_run"] and self.app.radio.caps.get("rx_only"):
             raise RuntimeError(f"{self.app.radio.name} is receive only: tick Dry run to listen and decode")
+        if self.app.mode_family() == "data":
+            raise RuntimeError("the robot transmits CW only for now (RTTY / FT8 / FT4 to come): switch to CW")
         if not re.fullmatch(r"[A-Z0-9/]{3,12}", self.cfg["mycall"] or ""):
             raise RuntimeError("set your callsign first")
         if not self.cfg["name"] or not self.cfg["qth"]:
@@ -533,7 +530,8 @@ class CWRobot:
         q = self.qso
         c = self.cfg
         t = time.time()
-        parsed = cwparse.parse(over, c["mycall"], q["call"], c["name"], c["qth"])
+        parsed = cwparse.parse(over, c["mycall"], q["call"], c["name"], c["qth"],
+                               known=self.app.overs.known(t, c["mycall"]))
         fields = {k: parsed[k] for k in SCHEMA["required"]}
         if parsed["confidence"] == "high":
             self._event("parse", f"({time.time() - t:.2f}s) " + json.dumps(fields))

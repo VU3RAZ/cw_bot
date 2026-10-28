@@ -60,6 +60,19 @@ waterfall, Listen, CW spots and the NCDXF beacon monitor all work on it.
 - **One connection per IP**: close the receiver's browser tab first. Some receivers stream for ~10 s and then send
   "all N channels in use" (Hamburg did on 2026-10-28 after many test connections); the driver then backs off 60 s,
   doubling to 5 min.
+- **Skimmer** (tile shown for KiwiSDR in CW / CW-R; `skimmer.py`): decodes every CW signal within ±4.8 kHz of the dial
+  at once. Ticking it switches the connection to I/Q (±5 kHz; the Kiwi takes the switch mid-stream), and the speaker
+  and main decoder audio are then made locally from the I/Q (`kiwi.IQDemod`: same passband and pitch, ~67 dB image
+  rejection). Every 0.5 s it scans the last 2 s for keyed tones; a tone found in two scans in a row gets a channel: a
+  CW decoder fed the complex I/Q at its offset (no images), a 60 Hz tone filter, its own frequency-locked loop, and the
+  over reader with callsign voting. Peaks that are a stronger signal's side lobes or key clicks (keyed in step with it,
+  or 12 dB below what it has lately been) get no channel; channels are at least 60 Hz apart, the limit for telling two
+  stations apart. A channel ignores its copy once its tone is gone (3 s) and closes after 30 s. A row shows once a
+  channel has copied something: kHz, call (only once sent twice, spotted or heard before; ✓ = also spotted), WPM, SNR
+  (keyed contrast), last copy. Click a row to tune there and make it the robot's target. Measured: on synthetic I/Q
+  with five stations (two 70 Hz apart) every call and speed right, 1.7 % of one core; on 87 s of real 40 m I/Q from De
+  Kiel the channels' copy matched a single decoder's on the same signals word for word; live, the whole process
+  (receive, demod, skimmer) used ~20 % of one core. It runs in its own thread, so a busy band doesn't stall the page.
 
 ## PC clock
 The beacon monitor (10 s slots) and FT8/FT4 need the PC clock NTP-synchronised. The server checks it at startup and
@@ -77,13 +90,31 @@ reference).
 - **Panadapter**: click to tune, mouse wheel steps by the Step setting; span / center-fixed / sweep speed set the radio scope.
 - **Frequency**: mouse wheel over a digit tunes that digit; click it to type (kHz or MHz). Arrow keys step.
 - **Audio waterfall**: click a signal to point the CW (snaps to the peak) or RTTY decoder at it.
+- **Side panel**: Controls, Spots and NCDXF Beacons, scrolling on their own beside the main column. The tables are
+  compact there; hover a spot row or a beacon name for the hidden columns (country, km, spotters, comment...).
+- **Tiles follow the mode**: CW / CW-R shows the CW decoder and the robot. Data (RTTY / RTTY-R, or any mode with the
+  data flag such as USB-D) shows RTTY beside FT8 / FT4, and the robot (it transmits CW only for now: its buttons are
+  disabled until RTTY and FT8 / FT4 transmit exist). SSB, AM and FM show no decoder, only the waterfalls. The server
+  runs only the current mode's decoders; the enable boxes keep their setting. A running robot always stays visible.
 - **CW**: auto speed tracking; raise SQL if it prints noise. **AFC** (on by default) puts the decoder on the station and keeps it there:
   every 0.25 s it looks for the tone with the most on/off contrast in the last 2 s (inside the CW filter, or ±150 Hz of
   where you put the decoder in other modes) and jumps there once two checks agree, typically 1.5-2 s after the station
   starts sending. A frequency-locked loop then measures the tone's phase during every key-down and keeps the decoder
   centred, mid-character too: on a test tone drifting 8 Hz/s it stays within 1.5 Hz (median). It ignores noise and
   carriers, holds a station for 3 s after it stops (a DX listening, the other side of a QSO) unless another is 6 dB
-  stronger, and starts over after a QSY. Send box uses the radio's keyer (CW mode, break-in on).
+  stronger, and starts over after a QSY.
+  **Raw / Parsed** switch on the CW tile: Raw is every character as decoded; Parsed splits the copy into overs (on
+  K / KN / BK / SK / AR or 5 s of silence) and shows each one cleaned by the robot's reader (`cwparse.py`: noise
+  dropped, merged words split, calls highlighted) under a line of what was sent: CQ, call → addressee, RST, name, QTH,
+  73. The over still being received updates live (dimmed, "…").
+  Calls in the Parsed view are repaired by voting, like forward error correction: every copy of a call in the over
+  (operators send it twice or more), the same call read in earlier overs (15 min) and calls spotted within 1 kHz of
+  the dial count as votes, and each letter takes the majority (DL3YFE + DL3TEE + DL3YEE -> DL3YEE; a copy that can't
+  be a call, like DLEYEE, joins the real one). One copy against one is left as received unless a spot, an earlier over
+  or cty.dat settles it; two real stations (OK1RR, OK1AB) are never merged, nor a call that may have lost its last
+  letter (OY1C / OY1CT). Repaired calls are underlined dotted; hover for what was received. The robot reads overs with
+  the same repair. On the KiwiSDR corpus copy it raised exact copies of the target's call from 84 % to 90 % (113 copies),
+  with none corrected away from it. Send box uses the radio's keyer (CW mode, break-in on).
   - The decoder selector picks **Std** (threshold decoder), **HMM** (statistical decoder, better on weak and fast
     signals, prints about 2 s late) or **Both**, which shows the HMM's copy under the standard copy on the same
     audio and pitch, for live comparison. The robot uses the HMM only when HMM alone is selected. The choice is saved in `settings.json`.
@@ -131,7 +162,7 @@ reference).
   the state is remembered per browser. The Controls column stays in view while scrolling.
 - **Listen**: the 🔈 button in the header streams the receiver audio (12 kHz) to the browser.
 
-## CW robot
+## Robot
 Makes a complete CW contact by itself using the local gpt-oss model on llama.cpp
 (`http://127.0.0.1:8081`, its `/completion` endpoint).
 
@@ -197,5 +228,5 @@ python3 cwtune.py --dry-run                     # search and report; drop --dry-
 - Tests: `python3 -m pytest -q tests`. Synthetic CW comes from `cwsynth.py`.
 
 Files: `radio.py` (IC-7300 CI-V), `ftdx10.py` (FTDX10 CAT), `rig.py` (radio detection, port + audio pairing), `clock.py` (NTP check), `decoders.py` (DSP), `cwhmm.py` (HMM CW decoder), `robot.py` (CW robot), `spots.py` (DX spots),
-`pathcheck.py` (who heard us), `beacons.py` (NCDXF beacon monitor), `beaconlog.py` + `spaceweather.py` (its JSONL propagation log), `geo.py` (cty.dat prefixes, grid/distance; `vendor/cty.dat`), `cwparse.py` (rule-based over reader), `kiwi.py` + `corpus.py` + `cwtune.py` (KiwiSDR capture and decoder tuning), `kiwisdr.py` (KiwiSDR as a receive-only radio), `server.py`
+`pathcheck.py` (who heard us), `beacons.py` (NCDXF beacon monitor), `beaconlog.py` + `spaceweather.py` (its JSONL propagation log), `geo.py` (cty.dat prefixes, grid/distance; `vendor/cty.dat`), `cwparse.py` (rule-based over reader), `kiwi.py` + `corpus.py` + `cwtune.py` (KiwiSDR capture and decoder tuning), `kiwisdr.py` (KiwiSDR as a receive-only radio), `skimmer.py` (CW skimmer over its I/Q), `server.py`
 (aiohttp + websocket), `static/` (UI).

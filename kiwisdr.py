@@ -10,6 +10,10 @@ app can tune it like the radios on USB. Differences:
   * the receiver is chosen from the public list (kiwi.find) and kept in settings.json
     "kiwi"; set_receiver() switches to another one.
 
+With the skimmer on, CW and CW-R run the connection in I/Q (+-5 kHz around the dial):
+the speaker/decoder audio is then made here (kiwi.IQDemod, same passband and pitch) and
+the raw I/Q goes to on_iq for skimmer.Skimmer. The Kiwi takes the switch mid-stream.
+
 Modes are made from the Kiwi's USB/LSB/AM/NBFM demodulators so the dial means what it
 means on the IC-7300: in CW the dial is the signal's frequency and it is heard at the CW
 pitch; in RTTY the dial is the mark frequency, mark at 2125 Hz (RTTY) or 2295 Hz (RTTY-R).
@@ -81,7 +85,7 @@ def demod(mode, filt, hz, pitch=PITCH):
 class KiwiRadio:
     name = "KiwiSDR"
     has_audio = True
-    caps = {"name": "KiwiSDR", "scope": True, "rx_only": True,
+    caps = {"name": "KiwiSDR", "scope": True, "rx_only": True, "skimmer": True,
             "filters": {"1": "WIDE", "2": "MID", "3": "NAR"},
             "filter_help": "CW 1.2 kHz / 500 Hz / 250 Hz, RTTY 2.4 kHz / 500 / 250, SSB 3.0 / 2.4 / 1.8 kHz",
             "preamp": ["P.AMP —"], "att": "no attenuator on a KiwiSDR",
@@ -97,11 +101,14 @@ class KiwiRadio:
             "nb": False, "nr": False, "agc": "MID", "smeter": 0, "tx": False,
             "po": 0, "swr": 0, "if_width": 500, "radio": self.name, "cw_pitch": PITCH, "break_in": 0,
             "scope_span": 25000, "scope_mode": "center", "scope_speed": "fast",
-            "receiver": self._rx_public(), "kiwi_status": "",
+            "receiver": self._rx_public(), "kiwi_status": "", "skim": False,
         }
         self.on_state = None           # callback(dict of changed keys)
         self.on_scope = None           # callback(lo_hz, hi_hz, bytes pixels 0-160)
         self.on_audio = None           # callback(bytes): 100 ms of 12 kHz s16le mono
+        self.on_iq = None              # callback(complex64 at 12 kHz, centre Hz) while skimming
+        self._iq_demod, self._iq_key = None, None
+        self._iq_fc = 0
         self.client = None
         self.wf = None
         self._fixed_cf = None          # kHz: the waterfall centre in "fixed" scope mode
@@ -237,6 +244,10 @@ class KiwiRadio:
             self._update(connected=True)
             self._status(f"listening on {self.rx.get('name') or self.rx['url']}")
         self._rssi.append(rssi)
+        if np.iscomplexobj(x):          # skimming: hand on the I/Q, demodulate the audio here
+            if self.on_iq:
+                self.on_iq(x, self._iq_fc)
+            x = (self._iq_demod or kiwi.IQToUSB())(x)
         self._buf = np.concatenate([self._buf, x])
         while len(self._buf) >= BLOCK:
             blk, self._buf = self._buf[:BLOCK], self._buf[BLOCK:]
@@ -248,9 +259,22 @@ class KiwiRadio:
     def _retune(self):
         s = self.state
         mode, lo, hi, khz, w = demod(s["mode"], s["filter"], s["freq"], s["cw_pitch"])
+        if s["skim"] and s["mode"] in ("CW", "CW-R"):
+            flip = s["mode"] == "CW-R"
+            key = (s["cw_pitch"], abs(lo), abs(hi), flip)
+            if key != self._iq_key:     # a new passband or pitch; a QSY keeps the filter state
+                p_lo, p_hi = sorted((abs(lo), abs(hi)))
+                self._iq_demod, self._iq_key = kiwi.IQDemod(s["cw_pitch"], p_lo, p_hi, flip), key
+            self._iq_fc = s["freq"]
+            mode, lo, hi, khz = "iq", kiwi.IQ_PASSBAND[0], kiwi.IQ_PASSBAND[1], s["freq"] / 1e3
         if self.client:
             self.client.tune(mode, lo, hi, khz)
         self._update(if_width=w)
+
+    def set_skim(self, on):
+        """Skimmer on/off: in CW the connection switches to I/Q (and back) mid-stream."""
+        self._update(skim=bool(on))
+        self._retune()
 
     def _apply_agc(self):
         if self.client:

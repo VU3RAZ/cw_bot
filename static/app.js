@@ -24,6 +24,7 @@ function connect() {
     else if (m.type === 'state') { Object.assign(state, m.state); renderState(m.state); if (m.state.freq) spotsBandCheck(); }
     else if (m.type === 'decoder') { dec = m.status; renderDecoder(); }
     else if (m.type === 'cw') { appendText('cwOut', m.text); $('cwInfo').textContent = `${dec.cw_freq.toFixed(0)} Hz · ${m.wpm} WPM`; }
+    else if (m.type === 'cw_over') renderOver(m.over);
     else if (m.type === 'cw2') { appendText('cw2Out', m.text); $('cw2Info').textContent = `${m.wpm} WPM`; }
     else if (m.type === 'rtty') appendText('rttyOut', m.text);
     else if (m.type === 'ft8') onFt8(m);
@@ -35,6 +36,7 @@ function connect() {
     else if (m.type === 'error' || m.type === 'notice') toast(m.msg);
     else if (m.type === 'clock') renderClock(m);
     else if (m.type === 'kiwi_list') renderKiwiList(m);
+    else if (m.type === 'skimmer') renderSkimmer(m);
   };
 }
 function send(obj) {
@@ -379,6 +381,7 @@ function renderRadios(m) {
   $('rfNote').textContent = caps.notes.join(' ');
   $('rfWrap').classList.toggle('no-scope', !caps.scope);
   document.body.classList.toggle('rx-only', !!caps.rx_only);
+  document.body.classList.toggle('skim-ok', !!caps.skimmer);
   renderState({ mode: 1, preamp: 1 });
   if (m.kiwi && !$('kiwiRegion').options.length) {
     $('kiwiRegion').innerHTML = m.kiwi.regions.map((r) => `<option value="${r}">${r}</option>`).join('');
@@ -455,6 +458,7 @@ function renderState(ch) {
     $('dataBtn').classList.toggle('on', !!state.data);
     document.querySelectorAll('#filters button').forEach((x) => x.classList.toggle('on', +x.dataset.fil === state.filter));
     renderDecoder();
+    applyModeFamily();
   }
   for (const name of Object.keys(LEVELS)) {
     if (name in ch) {
@@ -535,6 +539,88 @@ function appendText(id, text) {
   el.textContent += text;
   if (el.textContent.length > 20000) el.textContent = el.textContent.slice(-15000);
   if (atBottom) el.scrollTop = el.scrollHeight;
+}
+
+// ---- CW tile: Raw (every character) / Parsed (over by over, read by cwparse)
+function setCwView(v) {
+  lsSet('cwView', v);
+  $('cwOut').hidden = v !== 'raw'; $('cwParsed').hidden = v === 'raw';
+  $('cwRaw').classList.toggle('on', v === 'raw'); $('cwParsedBtn').classList.toggle('on', v !== 'raw');
+}
+$('cwRaw').onclick = () => setCwView('raw');
+$('cwParsedBtn').onclick = () => setCwView('parsed');
+$('cwClear').onclick = () => { $('cwOut').textContent = ''; $('cwParsed').textContent = ''; };
+setCwView(lsGet('cwView', 'raw'));
+
+// ---- KiwiSDR skimmer: every CW signal in the I/Q passband, one row each
+$('skOn').onchange = (ev) => send({ cmd: 'skimmer', on: ev.target.checked });
+$('skCalls').checked = lsGet('skCalls', false);
+$('skCalls').onchange = (ev) => { lsSet('skCalls', ev.target.checked); if (renderSkimmer.last) renderSkimmer(renderSkimmer.last); };
+function renderSkimmer(m) {
+  renderSkimmer.last = m;
+  $('skOn').checked = m.on;
+  const rows = $('skCalls').checked ? m.rows.filter((r) => r.call) : m.rows;
+  $('skInfo').textContent = !m.on ? 'off' : !m.active ? 'on, waiting for CW / CW-R mode'
+    : `${rows.length} signals copied · ${m.channels} tracked · ${((m.fc - m.span) / 1e3).toFixed(1)}–${((m.fc + m.span) / 1e3).toFixed(1)} kHz`;
+  const body = $('skBody'); body.textContent = '';
+  if (m.on && m.active && !rows.length) {
+    const td = body.insertRow().insertCell(); td.colSpan = 6; td.className = 'hint';
+    td.textContent = 'Listening… a signal shows once it has been copied.';
+  }
+  for (const r of rows) {
+    const tr = body.insertRow();
+    if (Math.abs(r.hz - state.freq) < 40) tr.className = 'cur';
+    tr.title = `${(r.hz / 1e3).toFixed(2)} kHz (${r.offset >= 0 ? '+' : ''}${r.offset} Hz from the dial)`
+      + (r.spotted ? ' · also spotted on RBN / the cluster' : '') + ' · click to tune there' + (r.call ? ' and set as robot target' : '');
+    for (const v of [(r.hz / 1e3).toFixed(2), r.call + (r.spotted ? ' ✓' : ''), r.wpm || '', r.snr, fmtAge(r.age), r.text]) {
+      const td = tr.insertCell(); td.textContent = v;
+    }
+    tr.cells[1].className = 'call';
+    tr.onclick = () => {
+      setFreq(r.hz);
+      if (r.call && !robotInQso) { clearOther(false); $('rbTarget').value = r.call; setSrc('call', 'you'); }
+    };
+  }
+}
+
+function renderOver(o) {
+  const box = $('cwParsed');
+  let row = box.querySelector(`[data-over="${o.id}"]`);
+  if (!o.text) { if (row) row.remove(); return; }
+  const atBottom = box.scrollTop + box.clientHeight >= box.scrollHeight - 20;
+  if (!row) {
+    row = document.createElement('div'); row.className = 'over'; row.dataset.over = o.id;
+    box.appendChild(row);
+    while (box.children.length > 200) box.firstChild.remove();
+  }
+  row.classList.toggle('live', !o.done);
+  row.textContent = '';
+  const sum = document.createElement('div'); sum.className = 'sum';
+  const chip = (txt, cls) => { const s = document.createElement('span'); s.textContent = txt; if (cls) s.className = cls; sum.appendChild(s); };
+  chip(new Date().toISOString().slice(11, 16), 'time');
+  if (o.cq) chip('CQ', 'tag');
+  if (o.call || o.to) chip(o.call && o.to ? `${o.call} → ${o.to}` : o.call || `→ ${o.to}`, 'who');
+  if (o.rst) chip(`RST ${o.rst}`);
+  if (o.name) chip(`name ${o.name}`);
+  if (o.qth) chip(`QTH ${o.qth}`);
+  if (o.asks_repeat) chip('asks repeat', 'tag');
+  if (o.sent_73) chip('73', 'tag');
+  if (!o.done) chip('…', 'time');
+  row.appendChild(sum);
+  const txt = document.createElement('div'); txt.className = 'txt';
+  const calls = new Set(o.calls);
+  const from = {};                   // corrected call -> the copies it was repaired from
+  for (const [a, b] of Object.entries(o.fixed || {})) (from[b] = from[b] || []).push(a);
+  o.text.split(' ').forEach((w, i) => {
+    if (i) txt.appendChild(document.createTextNode(' '));
+    if (calls.has(w) || from[w]) {
+      const b = document.createElement('b'); b.textContent = w;
+      if (from[w]) { b.className = 'fixed'; b.title = `corrected from ${from[w].join(', ')} (voted across its copies)`; }
+      txt.appendChild(b);
+    } else txt.appendChild(document.createTextNode(w));
+  });
+  row.appendChild(txt);
+  if (atBottom) box.scrollTop = box.scrollHeight;
 }
 
 function onFt8(m) {
@@ -651,7 +737,22 @@ for (const [id, k] of Object.entries(OB)) {
   });
 }
 
+// Tiles follow the mode: CW shows the CW decoder and the robot; data (RTTY, or the data
+// flag: USB-D, LSB-D...) shows RTTY beside FT8/FT4 and the robot (CW transmit only so
+// far); voice (SSB, AM, FM) shows neither, only the waterfalls. A running robot stays visible.
+const modeFamily = () => /^CW/.test(state.mode || '') ? 'cw'
+  : (/^RTTY/.test(state.mode || '') || state.data) ? 'data' : state.mode ? 'voice' : 'cw';
+function applyModeFamily() {
+  const fam = modeFamily();
+  document.body.dataset.fam = fam;
+  $('rbMode').textContent = fam === 'data' ? 'Data' : 'CW';
+  const idle = !document.body.classList.contains('robot-active');
+  document.querySelectorAll('.robot .tx-btns button:not(#rbStop)').forEach((b) => { b.disabled = fam === 'data' && idle; });
+}
+
 function renderRobot(st) {
+  document.body.classList.toggle('robot-active', !!st.active);
+  applyModeFamily();
   const el = $('robotState');
   el.textContent = st.active ? st.state : 'idle';
   el.className = 'robot-state' + (st.state === 'transmitting' ? ' tx' : st.active ? ' active' : '');
@@ -751,6 +852,8 @@ function renderSpots(m) {
     if (st.path) tr.classList.add('path');
     tr.title = `${st.sources.join(' + ')}`
       + (st.path ? ` · spotted ${st.path[0]} km from ${st.path[1]}, who heard your path check` : '')
+      + ` · ${st.country || '?'}` + (st.km != null ? ` · ${st.km} km` : '') + ` · ${st.spotters} spotter${st.spotters === 1 ? '' : 's'}`
+      + (st.wpm ? ` · ${st.wpm} WPM` : '') + (st.info ? ` · "${st.info}"` : '')
       + ` · click to tune in ${st.mode}` + (st.mode === 'CW' ? ' and set as robot target' : '');
     for (const v of [fmtAge(st.age), st.khz.toFixed(1), st.mode, st.call, st.wpm ?? '', st.snr ?? '', st.spotters,
                      st.km ?? '', st.path ? '✓' : '', st.country, st.info]) {
@@ -819,6 +922,7 @@ function renderBeacons(d) {
   bn.beacons.forEach((b, i) => {
     const tr = body.insertRow();
     for (const v of [b.call, b.loc, b.km ?? '', b.brg != null ? b.brg + '°' : '']) tr.insertCell().textContent = v;
+    tr.cells[0].title = `${b.call} · ${b.loc}` + (b.km != null ? ` · ${b.km} km` : '') + (b.brg != null ? ` · ${b.brg}°` : '');
     bn.bands.forEach((band, j) => {
       const td = tr.insertCell(), r = bn.results[`${i}:${j}`];
       td.className = 'bn-cell';

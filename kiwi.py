@@ -186,6 +186,25 @@ class IQToUSB:
         return y.real.astype(np.float32)
 
 
+class IQDemod:
+    """I/Q centred on the dial -> the audio a USB (or, flip=True, LSB) receiver tuned
+    shift_hz away would give: the I/Q is mirrored for LSB, moved up by shift_hz and
+    band-passed lo..hi Hz. In CW: shift = the pitch, so a signal on the dial is heard
+    at the pitch, as in the radio's own CW mode."""
+
+    def __init__(self, shift_hz, lo, hi, flip=False):
+        self.shift, self.flip, self.phase = float(shift_hz), flip, 0.0
+        self.bp = IQToUSB(lo, hi)
+
+    def __call__(self, iq):
+        if self.flip:
+            iq = np.conj(iq)
+        w = 2 * np.pi * self.shift / FS
+        y = iq * np.exp(1j * (self.phase + w * np.arange(len(iq))))
+        self.phase = (self.phase + w * len(iq)) % (2 * np.pi)
+        return self.bp(y)
+
+
 class Resampler:
     """Stateful linear interpolation from the receiver's sample rate (e.g. 11998.9 or
     20250 Hz) to FS, real or complex. The passband is well below either Nyquist."""

@@ -8,20 +8,24 @@ import argparse
 import asyncio
 import json
 import os
+import queue
 import shutil
 import struct
 import subprocess
+import threading
 import time
 
 import numpy as np
 from aiohttp import web, WSMsgType
 
+from cwparse import OverReader
 from decoders import FS, Spectrum, CWDecoder, PitchTracker, RTTYDecoder, FT8Decoder
 from cwhmm import CWHmm
 from radio import IC7300
 import rig
 import clock
 from robot import CWRobot
+from skimmer import SPAN, Skimmer
 from spots import Spots
 from pathcheck import PathCheck
 from beacons import BeaconMonitor
@@ -55,6 +59,12 @@ class App:
         self.cw_afc = bool(rig.load_settings().get("cw_afc", True))
         self.afc = PitchTracker()
         self.afc_sent, self.afc_shown = 0.0, 0.0    # last AFC update sent to the browser
+        self.overs = OverReader()   # the CW copy read over by over, for the tile's Parsed view
+        # KiwiSDR skimmer: I/Q blocks go to a worker thread, so decoding dozens of
+        # channels never holds up the event loop (websockets, audio)
+        self.skimmer = Skimmer()
+        self.skim_q = queue.Queue(maxsize=50)
+        threading.Thread(target=self.skim_worker, daemon=True).start()
         self.cw_anchor = self.cw.freq   # where the decoder was put (pitch or a click): AFC searches near it
         self.rtty = RTTYDecoder(2210)
         self.ft8 = FT8Decoder()
@@ -234,6 +244,11 @@ class App:
     def attach_radio(self):
         self.radio.on_state = self.on_state
         self.radio.on_scope = self.on_scope
+        if hasattr(self.radio, "set_skim"):
+            self.radio.on_iq = self.on_iq
+            if rig.load_settings().get("skimmer"):
+                self.radio.set_skim(True)
+        self.skim_q.put(None)               # a new radio: drop the old channels
         self.radio.start()
         if self.audio:
             self.audio.cancel()
@@ -317,28 +332,96 @@ class App:
                 else:
                     asyncio.ensure_future(ws.send_bytes(msg))
 
+    def spot_hints(self):
+        """Calls spotted within 1 kHz of the dial in the last 30 min: extra votes when the
+        Parsed view repairs a call (cwparse.correct_calls). Refreshed every 10 s."""
+        now = time.time()
+        if now - getattr(self, "_hints_t", 0) < 10:
+            return
+        self._hints_t = now
+        khz = (self.radio.state.get("freq") or 0) / 1000
+        self.overs.hints = self.spotted_near(khz, 1)
+
+    def spotted_near(self, khz, width_khz):
+        """{call: 1} spotted within width_khz of khz in the last 30 min."""
+        now = time.time()
+        return {s["call"]: 1 for s in self.spots.dxs + self.spots.rbn.spots
+                if abs(s["khz"] - khz) <= width_khz and now - s["ts"] < 1800}
+
+    # ---- KiwiSDR skimmer (worker thread) ---------------------------------
+    def on_iq(self, iq, fc):
+        try:
+            self.skim_q.put_nowait((iq, fc))
+        except queue.Full:
+            pass                            # the worker is behind: skip a block rather than lag
+
+    def skim_worker(self):
+        sent = hints_t = 0.0
+        while True:
+            item = self.skim_q.get()
+            now = time.time()
+            if item is None:
+                self.skimmer.clear()
+                sent = 0.0
+            else:
+                iq, fc = item
+                if now - hints_t > 10:
+                    hints_t = now
+                    self.skimmer.hints = self.spotted_near(fc / 1000, SPAN / 1000)
+                    self.skimmer.mycall = self.robot.cfg["mycall"]
+                try:
+                    self.skimmer.feed(iq, fc, now)
+                except Exception as e:      # never let one bad block stop the thread
+                    print("skimmer:", e)
+            if now - sent >= 1 or item is None:
+                sent = now
+                self.broadcast_json(type="skimmer", **self.skim_status(now))
+
+    def skim_status(self, now=None):
+        on = bool(self.radio.state.get("skim"))
+        return {"on": on, "active": on and str(self.radio.state.get("mode")) in ("CW", "CW-R"),
+                "fc": self.skimmer.fc, "span": SPAN, "channels": len(self.skimmer.channels),
+                "rows": self.skimmer.rows(now) if on else []}
+
+    def mode_family(self):
+        """cw / data / voice, as the page shows its tiles: data is RTTY or any mode with the
+        data flag (USB-D...). Only the decoders for the current family run."""
+        st = self.radio.state
+        mode = str(st.get("mode") or "")
+        if mode.startswith("CW"):
+            return "cw"
+        if mode.startswith("RTTY") or st.get("data"):
+            return "data"
+        return "voice" if mode else "cw"
+
     def process_audio(self, x, t_end):
         self.beacons.feed(x, t_end)
         for row in self.spectrum.feed(x):
             self._send_all(bytes([MSG_AUDIO]) + row)
-        if self.enabled["cw"]:
+        fam = self.mode_family()
+        if self.enabled["cw"] and fam == "cw":
             if self.cw_afc:
                 self.track_pitch(x)
             txt = self.cw.feed(x)
+            mycall = self.robot.cfg["mycall"]
+            self.spot_hints()
+            overs = self.overs.feed(txt, time.time(), mycall) if txt else self.overs.tick(time.time(), mycall)
             if txt:
                 self.broadcast_json(type="cw", text=txt, wpm=round(self.cw.wpm, 1))
                 self.robot.on_rx(txt)
+            for o in overs:
+                self.broadcast_json(type="cw_over", over=o)
             if self.cw2:
                 if self.cw2.freq != self.cw.freq:
                     self.cw2.retune(self.cw.freq)
                 txt = self.cw2.feed(x)
                 if txt:
                     self.broadcast_json(type="cw2", text=txt, wpm=round(self.cw2.wpm, 1))
-        if self.enabled["rtty"]:
+        if self.enabled["rtty"] and fam == "data":
             txt = self.rtty.feed(x)
             if txt:
                 self.broadcast_json(type="rtty", text=txt)
-        if self.enabled["ft8"]:
+        if self.enabled["ft8"] and fam == "data":
             done = self.ft8.feed(x, t_end)
             if done and not self.ft8_busy:
                 asyncio.ensure_future(self.run_ft8(*done))
@@ -420,6 +503,13 @@ class App:
             self.background(self.kiwi_list(m.get("region") or self.kiwi_region(), bool(m.get("refresh"))))
         elif c == "kiwi_select":
             await self.kiwi_select(m["url"])
+        elif c == "skimmer":
+            if not hasattr(r, "set_skim"):
+                raise RuntimeError("the skimmer needs a KiwiSDR (it decodes the receiver's I/Q)")
+            r.set_skim(bool(m["on"]))
+            rig.save_settings(skimmer=bool(m["on"]))
+            if not m["on"]:
+                self.skim_q.put(None)
         elif c == "send_cw":
             await run(r.send_cw, m["text"])
         elif c == "stop_cw":

@@ -248,13 +248,26 @@ CWDecoder.load_params()
 
 def keyed_contrast(x, lo=300, hi=2700):
     """(Hz, dB) arrays: per 25 Hz bin, the on/off contrast of its level (p97 - p30).
-    A keyed CW tone scores high; noise (~12 dB) and steady carriers don't."""
+    A keyed CW tone scores high; noise (~12 dB) and steady carriers don't. x may be
+    complex (I/Q): then lo..hi may be negative, offsets from the centre."""
+    f, c, _ = keyed_spectrum(x, lo, hi)
+    return f, c
+
+
+def keyed_spectrum(x, lo=300, hi=2700):
+    """keyed_contrast plus the level per 40 ms frame and bin (dB, frames x bins), to
+    tell whose keying a bin follows."""
     n = 480
     fr = x[:len(x) // n * n].reshape(-1, n) * np.hanning(n)
-    S = 10 * np.log10(np.abs(np.fft.rfft(fr, axis=1)) ** 2 + 1e-12)
-    f = np.fft.rfftfreq(n, 1 / FS)
+    if np.iscomplexobj(x):
+        S = 10 * np.log10(np.abs(np.fft.fftshift(np.fft.fft(fr, axis=1), axes=1)) ** 2 + 1e-12)
+        f = np.fft.fftshift(np.fft.fftfreq(n, 1 / FS))
+    else:
+        S = 10 * np.log10(np.abs(np.fft.rfft(fr, axis=1)) ** 2 + 1e-12)
+        f = np.fft.rfftfreq(n, 1 / FS)
     band = (f >= lo) & (f <= hi)
-    return f[band], np.percentile(S[:, band], 97, axis=0) - np.percentile(S[:, band], 30, axis=0)
+    S = S[:, band]
+    return f[band], np.percentile(S, 97, axis=0) - np.percentile(S, 30, axis=0), S
 
 
 class PitchTracker:
@@ -306,10 +319,12 @@ class PitchTracker:
         if hz is not None:
             self.peak = 0.0             # a new tone: learn its level
             return hz
-        hz = self._track(x, dec.freq)
+        hz = self.track(x, dec.freq)
         return min(max(hz, lo), hi) if hz is not None and self.locked else None
 
-    def _track(self, x, freq):
+    def track(self, x, freq):
+        """The loop alone: the tone's corrected pitch from this block, or None. x may be
+        complex (I/Q) and freq negative; the caller decides whether it is locked."""
         w = 2 * np.pi * freq / FS
         lo = np.exp(-1j * (self.phase + w * np.arange(len(x))))
         self.phase = (self.phase + w * len(x)) % (2 * np.pi)

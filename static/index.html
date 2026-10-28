@@ -99,7 +99,7 @@
   </section>
 
   <section class="decoders" data-title="Decoders">
-    <div class="dec">
+    <div class="dec cw">
       <div class="dec-head">
         <label class="chk"><input type="checkbox" id="enCw"> <b>CW</b></label>
         <select id="cwEngine" class="small" title="CW decoder: Std = threshold decoder, HMM = statistical decoder (~2 s later), Both = Std copy with the HMM's copy underneath, same audio">
@@ -108,15 +108,19 @@
         <label class="chk hint" title="AFC: finds the keyed tone in ~2 s and follows it to about a hertz (within the CW filter, or ±150 Hz of where you put the decoder)"><input type="checkbox" id="cwAfc"> AFC</label>
         <span id="cwInfo" class="hint"></span>
         <label class="chk hint" title="Squelch: signal must be this many times above the noise">SQL <input type="range" id="cwSql" min="2" max="20" step="0.5" value="6" style="width:70px"></label>
-        <button class="small" data-clear="cwOut">Clear</button>
+        <span class="seg" title="Raw: every character as decoded. Parsed: over by over, noise dropped, calls highlighted, with what was sent (call, RST, name, QTH)">
+          <button class="small" id="cwRaw">Raw</button><button class="small" id="cwParsedBtn">Parsed</button>
+        </span>
+        <button class="small" id="cwClear">Clear</button>
       </div>
       <div class="dec-out" id="cwOut"></div>
+      <div class="dec-out parsed" id="cwParsed" hidden></div>
       <div id="cw2Box" hidden>
         <div class="dec-head hint">HMM <span id="cw2Info"></span><button class="small" data-clear="cw2Out">Clear</button></div>
         <div class="dec-out" id="cw2Out"></div>
       </div>
     </div>
-    <div class="dec">
+    <div class="dec rtty">
       <div class="dec-head">
         <label class="chk"><input type="checkbox" id="enRtty"> <b>RTTY</b></label>
         <span id="rttyInfo" class="hint"></span>
@@ -138,6 +142,123 @@
         <table><thead><tr><th>UTC</th><th>Str</th><th>DT</th><th>Hz</th><th>Message</th></tr></thead>
         <tbody id="ft8Body"></tbody></table>
       </div>
+    </div>
+  </section>
+
+  
+
+  
+
+  <section class="skimmer" data-title="Skimmer">
+    <div class="dec-head">
+      <label class="chk" title="Decode every CW signal in the KiwiSDR's ±5 kHz around the dial at once (the connection switches to I/Q)"><input type="checkbox" id="skOn"> <b>Skimmer</b></label>
+      <label class="chk hint"><input type="checkbox" id="skCalls"> calls only</label>
+      <span id="skInfo" class="hint"></span>
+    </div>
+    <div class="dec-out table skim-table">
+      <table><thead><tr><th>kHz</th><th>Call</th><th>WPM</th><th>SNR</th><th>Last</th><th>Copy</th></tr></thead>
+      <tbody id="skBody"></tbody></table>
+    </div>
+  </section>
+
+  <section class="pathcheck" data-title="Path check">
+    <div class="dec-head">
+      <b>Path check</b> <span id="pcInfo" class="hint">not run yet - use the Path check button in the robot panel</span>
+    </div>
+    <div class="dec-out table pc-table" id="pcWrap" hidden>
+      <table><thead><tr><th>Receiver</th><th>Heard via</th><th>Country</th><th>Grid</th><th>km</th><th>Brg</th><th>SNR</th><th>kHz</th><th>UTC</th></tr></thead>
+      <tbody id="pcBody"></tbody></table>
+    </div>
+  </section>
+
+  <section class="robot" data-title="Robot">
+    <div class="robot-head">
+      <b>Robot</b> <span class="hint" id="rbMode">CW</span>
+      <span class="hint">gpt-oss via llama.cpp</span>
+      <span id="robotState" class="robot-state">idle</span>
+    </div>
+    <div class="robot-grid">
+      <div class="robot-cfg">
+        <div class="stations">
+          <fieldset class="station">
+            <legend>My station</legend>
+            <label>My call <input id="rbCall" placeholder="N0CALL"></label>
+            <label>My name <input id="rbName" placeholder="JOHN"></label>
+            <label>My QTH <input id="rbQth" placeholder="CITY"></label>
+            <label>My grid <input id="rbGrid" placeholder="MK82 (optional)"></label>
+            <label>Send WPM <input id="rbWpm" type="number" min="8" max="40" value="20"></label>
+            <label>Max CQs <input id="rbMaxCq" type="number" min="1" max="30" value="6"></label>
+          </fieldset>
+          <fieldset class="station other">
+            <legend>Other station <span id="obState" class="hint">no contact</span></legend>
+            <label>Call <input id="rbTarget" placeholder="to answer"><span class="src" id="src_call"></span></label>
+            <label>RST sent <input id="obRstSent" placeholder="auto"><span class="src" id="src_rst_sent"></span></label>
+            <label>RST rcvd <input id="obRstRcvd" placeholder="decoded"><span class="src" id="src_rst_rcvd"></span></label>
+            <label>Name <input id="obName" placeholder="decoded"><span class="src" id="src_name"></span></label>
+            <label>QTH <input id="obQth" placeholder="decoded"><span class="src" id="src_qth"></span></label>
+            <div class="hint ob-help">Filled from the decoder during a contact. Type to correct; your value is kept.</div>
+          </fieldset>
+        </div>
+        <div class="btns">
+          <label class="chk"><input type="checkbox" id="rbAfc" checked> AFC</label>
+          <label class="chk dry"><input type="checkbox" id="rbDry" checked> Dry run (don't transmit)</label>
+        </div>
+        <div class="hint data-only">Data mode: the robot transmits CW only for now. RTTY and FT8 / FT4 transmit are
+          to come; switch to CW to use it.</div>
+        <div class="btns tx-btns">
+          <button id="rbCq">Call CQ</button>
+          <button id="rbPath" title="QRL?, then 3 CQs; shows who heard you (RBN + PSKReporter)">Path check</button>
+          <button id="rbAnswer" title="Call the station in Other station / Call">Answer</button>
+          <button id="rbHunt" title="Listen on this frequency and answer the first CQ (skips CQ DX from your own country, CQ EU etc. not meant for you); up to 30 min">Hunt</button>
+          <select id="rbHuntWho" title="Which CQ callers Hunt answers"><option value="all">All stations</option><option value="dx">DX only</option></select>
+          <button id="rbStop" class="danger on">STOP</button>
+        </div>
+        <div class="cwsend">
+          <input id="rbInject" placeholder="Simulate received CW (testing)">
+          <button id="rbInjectBtn">Inject RX</button>
+        </div>
+      </div>
+      <div class="dec-out robot-log" id="rbLog"></div>
+    </div>
+  </section>
+  </div>
+
+  <aside class="side">
+  <section class="controls" data-title="Controls">
+    <div class="group">
+      <div class="gtitle">Band</div>
+      <div class="btns" id="bands"></div>
+    </div>
+    <div class="group">
+      <div class="gtitle">Mode</div>
+      <div class="btns" id="modes"></div>
+      <div class="btns" id="filters"></div>
+    </div>
+    <div class="group">
+      <div class="gtitle">Receive</div>
+      <div class="btns">
+        <button id="preamp">P.AMP OFF</button>
+        <button id="att">ATT</button>
+        <button id="nb">NB</button>
+        <button id="nr">NR</button>
+        <button id="agc">AGC</button>
+      </div>
+      <label class="slider">AF <input type="range" id="af" min="0" max="255"><span id="afV"></span></label>
+      <label class="slider">RF <input type="range" id="rf" min="0" max="255"><span id="rfV"></span></label>
+    </div>
+    <div class="group tx">
+      <div class="gtitle">Transmit</div>
+      <label class="slider">PWR <input type="range" id="power" min="0" max="255"><span id="powerV"></span></label>
+      <label class="slider">WPM <input type="range" id="keyspeed" min="0" max="255"><span id="keyspeedV"></span></label>
+      <div class="btns">
+        <button id="ptt" class="danger">PTT</button>
+        <button id="tune">TUNE</button>
+      </div>
+      <div class="cwsend">
+        <input id="cwText" placeholder="CW to send (radio keyer, CW mode)" maxlength="120">
+        <button id="cwSend">Send</button><button id="cwStop">Stop</button>
+      </div>
+      <div class="macros" id="macros"></div>
     </div>
   </section>
 
@@ -183,104 +304,7 @@
       Hover a cell for details. Dim = older than 15 min. Receive only; while running the radio is in CW with filter FIL2 (500 Hz) and retuned every 10 s;
       frequency, mode and filter are restored on Stop.</div>
   </section>
-
-  <section class="pathcheck" data-title="Path check">
-    <div class="dec-head">
-      <b>Path check</b> <span id="pcInfo" class="hint">not run yet - use the Path check button in the robot panel</span>
-    </div>
-    <div class="dec-out table pc-table" id="pcWrap" hidden>
-      <table><thead><tr><th>Receiver</th><th>Heard via</th><th>Country</th><th>Grid</th><th>km</th><th>Brg</th><th>SNR</th><th>kHz</th><th>UTC</th></tr></thead>
-      <tbody id="pcBody"></tbody></table>
-    </div>
-  </section>
-
-  <section class="robot" data-title="CW Robot">
-    <div class="robot-head">
-      <b>CW Robot</b>
-      <span class="hint">gpt-oss via llama.cpp</span>
-      <span id="robotState" class="robot-state">idle</span>
-    </div>
-    <div class="robot-grid">
-      <div class="robot-cfg">
-        <div class="stations">
-          <fieldset class="station">
-            <legend>My station</legend>
-            <label>My call <input id="rbCall" placeholder="N0CALL"></label>
-            <label>My name <input id="rbName" placeholder="JOHN"></label>
-            <label>My QTH <input id="rbQth" placeholder="CITY"></label>
-            <label>My grid <input id="rbGrid" placeholder="MK82 (optional)"></label>
-            <label>Send WPM <input id="rbWpm" type="number" min="8" max="40" value="20"></label>
-            <label>Max CQs <input id="rbMaxCq" type="number" min="1" max="30" value="6"></label>
-          </fieldset>
-          <fieldset class="station other">
-            <legend>Other station <span id="obState" class="hint">no contact</span></legend>
-            <label>Call <input id="rbTarget" placeholder="to answer"><span class="src" id="src_call"></span></label>
-            <label>RST sent <input id="obRstSent" placeholder="auto"><span class="src" id="src_rst_sent"></span></label>
-            <label>RST rcvd <input id="obRstRcvd" placeholder="decoded"><span class="src" id="src_rst_rcvd"></span></label>
-            <label>Name <input id="obName" placeholder="decoded"><span class="src" id="src_name"></span></label>
-            <label>QTH <input id="obQth" placeholder="decoded"><span class="src" id="src_qth"></span></label>
-            <div class="hint ob-help">Filled from the decoder during a contact. Type to correct; your value is kept.</div>
-          </fieldset>
-        </div>
-        <div class="btns">
-          <label class="chk"><input type="checkbox" id="rbAfc" checked> AFC</label>
-          <label class="chk dry"><input type="checkbox" id="rbDry" checked> Dry run (don't transmit)</label>
-        </div>
-        <div class="btns">
-          <button id="rbCq">Call CQ</button>
-          <button id="rbPath" title="QRL?, then 3 CQs; shows who heard you (RBN + PSKReporter)">Path check</button>
-          <button id="rbAnswer" title="Call the station in Other station / Call">Answer</button>
-          <button id="rbHunt" title="Listen on this frequency and answer the first CQ (skips CQ DX from your own country, CQ EU etc. not meant for you); up to 30 min">Hunt</button>
-          <select id="rbHuntWho" title="Which CQ callers Hunt answers"><option value="all">All stations</option><option value="dx">DX only</option></select>
-          <button id="rbStop" class="danger on">STOP</button>
-        </div>
-        <div class="cwsend">
-          <input id="rbInject" placeholder="Simulate received CW (testing)">
-          <button id="rbInjectBtn">Inject RX</button>
-        </div>
-      </div>
-      <div class="dec-out robot-log" id="rbLog"></div>
-    </div>
-  </section>
-  </div>
-
-  <section class="controls" data-title="Controls">
-    <div class="group">
-      <div class="gtitle">Band</div>
-      <div class="btns" id="bands"></div>
-    </div>
-    <div class="group">
-      <div class="gtitle">Mode</div>
-      <div class="btns" id="modes"></div>
-      <div class="btns" id="filters"></div>
-    </div>
-    <div class="group">
-      <div class="gtitle">Receive</div>
-      <div class="btns">
-        <button id="preamp">P.AMP OFF</button>
-        <button id="att">ATT</button>
-        <button id="nb">NB</button>
-        <button id="nr">NR</button>
-        <button id="agc">AGC</button>
-      </div>
-      <label class="slider">AF <input type="range" id="af" min="0" max="255"><span id="afV"></span></label>
-      <label class="slider">RF <input type="range" id="rf" min="0" max="255"><span id="rfV"></span></label>
-    </div>
-    <div class="group tx">
-      <div class="gtitle">Transmit</div>
-      <label class="slider">PWR <input type="range" id="power" min="0" max="255"><span id="powerV"></span></label>
-      <label class="slider">WPM <input type="range" id="keyspeed" min="0" max="255"><span id="keyspeedV"></span></label>
-      <div class="btns">
-        <button id="ptt" class="danger">PTT</button>
-        <button id="tune">TUNE</button>
-      </div>
-      <div class="cwsend">
-        <input id="cwText" placeholder="CW to send (radio keyer, CW mode)" maxlength="120">
-        <button id="cwSend">Send</button><button id="cwStop">Stop</button>
-      </div>
-      <div class="macros" id="macros"></div>
-    </div>
-  </section>
+  </aside>
 </main>
 <div id="toast"></div>
 <script src="/static/app.js"></script>
