@@ -5,22 +5,22 @@ import numpy as np
 import cwsynth
 import kiwi
 from decoders import FS
-from skimmer import Skimmer
+from skimmer import MultiSkimmer, Skimmer
 
 STATIONS = [(-3000, "CQ CQ DE DL3YEE DL3YEE K", 22, 0.3), (-1200, "CQ TEST OK1RR OK1RR TEST", 28, 0.15),
             (150, "CQ CQ DE VU2TMP VU2TMP K", 18, 0.1), (220, "CQ DE EA6NB EA6NB K", 25, 0.2),
             (2500, "CQ DE JA1ABC JA1ABC K", 20, 0.05)]
 
 
-def band(seconds=45, seed=7):
+def band(seconds=45, seed=7, stations=STATIONS, rate=FS):
     rng = np.random.default_rng(seed)
-    n = FS * seconds
+    n = rate * seconds
     iq = (rng.normal(0, 0.02, n) + 1j * rng.normal(0, 0.02, n)).astype(np.complex64)
-    t = np.arange(n) / FS
-    for off, text, wpm, amp in STATIONS:
-        key = np.concatenate([np.full(int(s * FS), 1.0 if k else 0.0)
+    t = np.arange(n) / rate
+    for off, text, wpm, amp in stations:
+        key = np.concatenate([np.full(int(s * rate), 1.0 if k else 0.0)
                               for k, s in cwsynth.keying((text + " ") * 6, wpm, rng=rng)])[:n]
-        key = np.convolve(np.pad(key, (0, n - len(key))), np.ones(48) / 48, "same")
+        key = np.convolve(np.pad(key, (0, n - len(key))), np.ones(4 * rate // 1000) / (4 * rate // 1000), "same")
         iq += (amp * key * np.exp(2j * np.pi * (off + rng.uniform(-8, 8)) * t)).astype(np.complex64)
     return iq
 
@@ -68,3 +68,33 @@ def test_iq_demod_cw_and_cw_r():
     y = kiwi.IQDemod(600, 350, 850)(np.exp(2j * np.pi * 100 * t))[FS // 2:]
     image = kiwi.IQDemod(600, 350, 850)(np.exp(-2j * np.pi * 1300 * t))[FS // 2:]
     assert 20 * np.log10(y.std() / image.std()) > 60
+
+
+WIDE = [(-8200, "CQ DE DL3YEE DL3YEE K", 22, 0.2), (-5600, "CQ TEST OK1RR OK1RR TEST", 26, 0.1),
+        (-60, "CQ CQ DE VU2TMP VU2TMP K", 20, 0.1), (4380, "CQ DE EA6NB EA6NB K", 24, 0.15),
+        (7700, "CQ DE JA1ABC JA1ABC K", 18, 0.05)]
+
+
+def test_subband_passes_its_half_and_stops_the_rest():
+    t = np.arange(2 * FS) / (2 * FS)
+    sub = kiwi.Subband(4400)
+    def level(hz):
+        y = np.concatenate([sub(c) for c in np.split(np.exp(2j * np.pi * hz * t).astype(np.complex64), 20)])
+        return 20 * np.log10(np.sqrt(np.mean(np.abs(y[FS // 2:]) ** 2)) + 1e-12)
+    for hz in (0, 2000, 4400, 6800, 8800):          # its own +-4.4 kHz, moved to 12 kHz
+        assert abs(level(hz)) < 0.5
+    for hz in (-1500, -4400, -8800, 11000):         # the other half, and what would alias in
+        assert level(hz) < -60
+
+
+def test_wideband_skims_both_halves_and_the_seam():
+    sk = MultiSkimmer()
+    iq = band(45, stations=WIDE, rate=2 * FS)
+    for k in range(0, len(iq), 2400):
+        sk.feed(iq[k:k + 2400], 14_030_000, 2 * FS, now=k / (2 * FS))
+    assert sk.wide and sk.span == 8800
+    rows = sk.rows(now=45)
+    assert sorted(r["call"] for r in rows) == ["DL3YEE", "EA6NB", "JA1ABC", "OK1RR", "VU2TMP"]
+    for (off, _, wpm, _), r in zip(sorted(WIDE), sorted(rows, key=lambda r: r["offset"])):
+        assert abs(r["offset"] - off) <= 15 and abs(r["wpm"] - wpm) <= 3
+        assert r["hz"] == 14_030_000 + r["offset"]

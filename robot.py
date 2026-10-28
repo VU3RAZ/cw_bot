@@ -206,6 +206,8 @@ class CWRobot:
         self.anchor = None         # AFC anchor pitch
         self.last_tx = ""
         self.llm_secs = 0
+        self.cands = []            # Hunt with the skimmer: the CQ callers it could answer, strongest first
+        self.pick = ""             # the one being answered
 
     # ---------------------------------------------------------- public API
     @property
@@ -215,7 +217,8 @@ class CWRobot:
     def status(self):
         q = self.qso or {}
         return {"state": self.state, "active": self.active, "cfg": self.cfg, "in_qso": bool(q),
-                "qso": {k: q.get(k, "") for k in QSO_FIELDS}, "locked": sorted(q.get("locked", ()))}
+                "qso": {k: q.get(k, "") for k in QSO_FIELDS}, "locked": sorted(q.get("locked", ())),
+                "cands": self.cands if self.active else [], "pick": self.pick if self.active else ""}
 
     def configure(self, cfg):
         for k in ("mycall", "name", "qth", "rig", "grid"):
@@ -319,6 +322,7 @@ class CWRobot:
             if self.qso:
                 self._finish(f"error: {e}")
         finally:
+            self.cands, self.pick = [], ""
             self._set_state("idle")
 
     async def _setup_radio(self):
@@ -379,52 +383,131 @@ class CWRobot:
                 self.qso = None      # not for us: keep listening after our CQ
         self._event("note", f"no answer after {calls} CQ calls")
 
-    async def _hunt(self, minutes=30, calls_each=2):
-        """Listen on the frequency, answer the first CQ we may answer, and work that one
-        contact. Directed CQs that exclude us (CQ DX from our own country, CQ EU from
-        Asia...) are skipped, and so is a station that did not come back to us."""
-        my = self.cfg["mycall"]
-        me = geo.lookup(my) or {}
+    def _not_for_us(self, call, directed):
+        """Why we may not answer this CQ ("" if we may): directed CQs that exclude us
+        (CQ DX from our own country, CQ EU from Asia...), or DX-only hunting."""
+        me, them = geo.lookup(self.cfg["mycall"]) or {}, geo.lookup(call) or {}
+        if self.cfg["hunt"] == "dx" and them.get("country") == me.get("country"):
+            return f"{call} is in {me.get('country')} (hunting DX only)"
+        if directed == "DX" and them.get("country") == me.get("country"):
+            return f"{call} is calling CQ DX and is in {me.get('country')} too"
+        if directed in CONTINENTS and directed != me.get("cont"):
+            return f"{call} is calling CQ {directed} only"
+        if directed == "JA" and me.get("country") != "Japan":
+            return f"{call} is calling CQ JA only"
+        return ""
+
+    async def _hunt(self, minutes=30):
+        """Answer a CQ we may answer and work that contact. With the KiwiSDR skimmer on,
+        every CQ in its span is a candidate and the strongest is answered (the radio is
+        tuned onto it); otherwise only the main decoder's frequency is listened to.
+        A station that did not come back to us is skipped for SKIP_S."""
         skipped = {}                        # call -> time we last decided not to call it
         end = time.time() + minutes * 60
         while time.time() < end:
+            if self._skimming():
+                if await self._hunt_skimmer(skipped):
+                    return
+                continue
+            self.cands = []
             self._set_state("hunting: listening for CQ")
-            over = await self._wait_over(60)
+            over = await self._wait_over(10 if self.app.radio.state.get("skim") else 60)
             if over is None:
                 continue
             call, directed = cq_caller(over)
-            if not call or call == my or time.time() - skipped.get(call, 0) < 300:
+            if not call or call == self.cfg["mycall"] or time.time() - skipped.get(call, 0) < self.SKIP_S:
                 continue
-            them = geo.lookup(call) or {}
-            if self.cfg["hunt"] == "dx" and them.get("country") == me.get("country"):
-                why = f"{call} is in {me.get('country')} (hunting DX only)"
-            elif directed == "DX" and them.get("country") == me.get("country"):
-                why = f"{call} is calling CQ DX and is in {me.get('country')} too"
-            elif directed in CONTINENTS and directed != me.get("cont"):
-                why = f"{call} is calling CQ {directed} only"
-            elif directed == "JA" and me.get("country") != "Japan":
-                why = f"{call} is calling CQ JA only"
-            else:
-                why = ""
+            why = self._not_for_us(call, directed)
             if why:
                 self._event("note", f"{why} - not answering, still listening")
                 skipped[call] = time.time()
                 continue
+            them = geo.lookup(call) or {}
             self._event("note", f"heard {call} calling CQ ({them.get('country', '?')}) - answering")
-            self._new_qso(call, "answering")
-            for _ in range(calls_each):
-                await self._tx(f"{call} DE {my} {my} K")
-                reply = await self._wait_over(10)
-                if reply and heard_call(my, reply):
-                    await self._handle_over(reply)
-                    await self._qso_loop()
-                    return
-                if reply and cq_caller(reply)[0] != call:
-                    break                   # they are working someone else
-            self._event("note", f"{call} did not come back to us - still listening")
-            self.qso = None                 # not a contact: nothing to log
-            skipped[call] = time.time()
+            if await self._answer_cq(call, skipped):
+                return
         self._event("note", f"hunt: no answerable CQ in {minutes} min")
+
+    SKIP_S = 300            # s a station that did not answer us (or a CQ not for us) is left alone
+
+    def _skimming(self):
+        return bool(self.app.radio.state.get("skim")) and time.time() - self.app.skim_cq_t < 3
+
+    def _candidates(self, skipped):
+        """The skimmer's CQ callers, strongest first, each with why it can't be answered
+        ("" = it can)."""
+        out = []
+        for c in self.app.skim_cq:
+            call = c["call"]
+            d = CQ_DIRECTED.search(c["text"])
+            directed = (d.group(1) or "DX") if d else ""
+            them = geo.lookup(call) or {}
+            why = self._not_for_us(call, directed)
+            if not why and time.time() - skipped.get(call, 0) < self.SKIP_S:
+                why = "tried, no answer"
+            out.append(dict(c, country=them.get("country", "?"), directed=directed, why=why))
+        out.sort(key=lambda c: (bool(c["why"]), -c["snr"]))
+        return out
+
+    async def _hunt_skimmer(self, skipped):
+        """One pick from the skimmer's CQ list. True when a contact was worked."""
+        self.cands = self._candidates(skipped)
+        ok = [c for c in self.cands if not c["why"]]
+        self._set_state(f"hunting: {len(ok)} of {len(self.cands)} CQs answerable" if self.cands
+                        else "hunting: skimmer hears no CQ")
+        self._broadcast_status()
+        if not ok:
+            await asyncio.sleep(1)
+            return False
+        c = ok[0]
+        call = self.pick = c["call"]
+        self._event("note", f"skimmer: {call} CQ on {c['hz'] / 1e3:.2f} kHz, {c['snr']} dB, {c['wpm']} WPM "
+                    f"({c['country']}), strongest of {len(ok)} - tuning there")
+        await self._tune_to(c["hz"])
+        if not (c["done"] and c["age"] < 6):
+            # still calling: wait for the end of the CQ before answering. The main decoder
+            # joins mid-over, so it may hear only "...KTZ PSE K": then the skimmer's word
+            # that this CQ has just ended is enough.
+            over = await self._wait_over(20)
+            now = next((s for s in self.app.skim_cq if s["call"] == call), None)
+            heard = over and "CQ" in over.replace(" ", "") and heard_call(call, over)
+            if not (heard or (over and now and now["done"] and now["age"] < 6)):
+                self._event("note", f"{call}: no end of CQ heard - next")
+                skipped[call] = time.time()
+                self.pick = ""
+                return False
+        self._event("note", f"answering {call}")
+        return await self._answer_cq(call, skipped)
+
+    async def _tune_to(self, hz):
+        """Put a station on the main decoder: the radio's dial on its carrier (in CW
+        mode it is then heard at the pitch), decoder and AFC anchor on the pitch."""
+        r = self.app.radio
+        await asyncio.get_running_loop().run_in_executor(None, r.set_freq, int(hz))
+        pitch = r.state.get("cw_pitch") or 600
+        self.anchor = pitch
+        self.app.follow_pitch(pitch)
+        await asyncio.sleep(1.0)            # the new audio reaches the decoder
+        self.rx = ""
+
+    async def _answer_cq(self, call, skipped, calls_each=2):
+        """Call a CQing station; work the contact if it comes back. True if it did."""
+        my = self.cfg["mycall"]
+        self._new_qso(call, "answering")
+        self._broadcast_status()
+        for _ in range(calls_each):
+            await self._tx(f"{call} DE {my} {my} K")
+            reply = await self._wait_over(10)
+            if reply and heard_call(my, reply):
+                await self._handle_over(reply)
+                await self._qso_loop()
+                return True
+            if reply and cq_caller(reply)[0] != call:
+                break                       # they are working someone else
+        self._event("note", f"{call} did not come back to us - still listening")
+        self.qso, self.pick = None, ""      # not a contact: nothing to log
+        skipped[call] = time.time()
+        return False
 
     async def _qso_loop(self):
         my = self.cfg["mycall"]

@@ -106,7 +106,8 @@ class KiwiRadio:
         self.on_state = None           # callback(dict of changed keys)
         self.on_scope = None           # callback(lo_hz, hi_hz, bytes pixels 0-160)
         self.on_audio = None           # callback(bytes): 100 ms of 12 kHz s16le mono
-        self.on_iq = None              # callback(complex64 at 12 kHz, centre Hz) while skimming
+        self.on_iq = None              # callback(complex64, centre Hz, rate: 12 or 24 kHz) while skimming
+        self._mid = None               # kiwi.Subband(0): the middle 12 kHz of wideband I/Q, for the speaker
         self._iq_demod, self._iq_key = None, None
         self._iq_fc = 0
         self.client = None
@@ -245,8 +246,12 @@ class KiwiRadio:
             self._status(f"listening on {self.rx.get('name') or self.rx['url']}")
         self._rssi.append(rssi)
         if np.iscomplexobj(x):          # skimming: hand on the I/Q, demodulate the audio here
+            rate = self.client.iq_rate if self.client else kiwi.FS
             if self.on_iq:
-                self.on_iq(x, self._iq_fc)
+                self.on_iq(x, self._iq_fc, rate)
+            if rate != kiwi.FS:         # wideband: the speaker needs only the middle
+                self._mid = self._mid or kiwi.Subband(0)
+                x = self._mid(x)
             x = (self._iq_demod or kiwi.IQToUSB())(x)
         self._buf = np.concatenate([self._buf, x])
         while len(self._buf) >= BLOCK:
@@ -266,7 +271,7 @@ class KiwiRadio:
                 p_lo, p_hi = sorted((abs(lo), abs(hi)))
                 self._iq_demod, self._iq_key = kiwi.IQDemod(s["cw_pitch"], p_lo, p_hi, flip), key
             self._iq_fc = s["freq"]
-            mode, lo, hi, khz = "iq", kiwi.IQ_PASSBAND[0], kiwi.IQ_PASSBAND[1], s["freq"] / 1e3
+            mode, lo, hi, khz = "iq", 0, 0, s["freq"] / 1e3     # the client picks +-5 or +-10 kHz
         if self.client:
             self.client.tune(mode, lo, hi, khz)
         self._update(if_width=w)

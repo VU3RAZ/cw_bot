@@ -209,7 +209,7 @@
           <button id="rbCq">Call CQ</button>
           <button id="rbPath" title="QRL?, then 3 CQs; shows who heard you (RBN + PSKReporter)">Path check</button>
           <button id="rbAnswer" title="Call the station in Other station / Call">Answer</button>
-          <button id="rbHunt" title="Listen on this frequency and answer the first CQ (skips CQ DX from your own country, CQ EU etc. not meant for you); up to 30 min">Hunt</button>
+          <button id="rbHunt" title="Answer a CQ (skips CQ DX from your own country, CQ EU etc. not meant for you); up to 30 min. With the KiwiSDR skimmer on: every CQ in its span is listed and the strongest is answered, the radio tuned onto it; otherwise only this frequency">Hunt</button>
           <select id="rbHuntWho" title="Which CQ callers Hunt answers"><option value="all">All stations</option><option value="dx">DX only</option></select>
           <button id="rbStop" class="danger on">STOP</button>
         </div>
@@ -217,6 +217,11 @@
           <input id="rbInject" placeholder="Simulate received CW (testing)">
           <button id="rbInjectBtn">Inject RX</button>
         </div>
+      </div>
+      <div class="hunt-list" id="rbHuntList">
+        <div class="hint">Hunt · CQs on the skimmer, strongest answerable first</div>
+        <table><thead><tr><th>kHz</th><th>Call</th><th>Country</th><th>dB</th><th>WPM</th><th></th></tr></thead>
+          <tbody id="rbHuntBody"></tbody></table>
       </div>
       <div class="dec-out robot-log" id="rbLog"></div>
     </div>

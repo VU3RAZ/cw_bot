@@ -25,7 +25,7 @@ from radio import IC7300
 import rig
 import clock
 from robot import CWRobot
-from skimmer import SPAN, Skimmer
+from skimmer import MultiSkimmer
 from spots import Spots
 from pathcheck import PathCheck
 from beacons import BeaconMonitor
@@ -62,8 +62,9 @@ class App:
         self.overs = OverReader()   # the CW copy read over by over, for the tile's Parsed view
         # KiwiSDR skimmer: I/Q blocks go to a worker thread, so decoding dozens of
         # channels never holds up the event loop (websockets, audio)
-        self.skimmer = Skimmer()
+        self.skimmer = MultiSkimmer()
         self.skim_q = queue.Queue(maxsize=50)
+        self.skim_cq, self.skim_cq_t = [], 0.0  # stations calling CQ, from the skimmer (Hunt answers these)
         threading.Thread(target=self.skim_worker, daemon=True).start()
         self.cw_anchor = self.cw.freq   # where the decoder was put (pitch or a click): AFC searches near it
         self.rtty = RTTYDecoder(2210)
@@ -349,9 +350,9 @@ class App:
                 if abs(s["khz"] - khz) <= width_khz and now - s["ts"] < 1800}
 
     # ---- KiwiSDR skimmer (worker thread) ---------------------------------
-    def on_iq(self, iq, fc):
+    def on_iq(self, iq, fc, rate):
         try:
-            self.skim_q.put_nowait((iq, fc))
+            self.skim_q.put_nowait((iq, fc, rate))
         except queue.Full:
             pass                            # the worker is behind: skip a block rather than lag
 
@@ -364,23 +365,26 @@ class App:
                 self.skimmer.clear()
                 sent = 0.0
             else:
-                iq, fc = item
+                iq, fc, rate = item
                 if now - hints_t > 10:
                     hints_t = now
-                    self.skimmer.hints = self.spotted_near(fc / 1000, SPAN / 1000)
+                    self.skimmer.hints = self.spotted_near(fc / 1000, self.skimmer.span / 1000)
                     self.skimmer.mycall = self.robot.cfg["mycall"]
                 try:
-                    self.skimmer.feed(iq, fc, now)
+                    self.skimmer.feed(iq, fc, rate, now)
                 except Exception as e:      # never let one bad block stop the thread
                     print("skimmer:", e)
             if now - sent >= 1 or item is None:
                 sent = now
+                self.skim_cq = self.skimmer.cqs(now) if self.radio.state.get("skim") else []
+                self.skim_cq_t = now
                 self.broadcast_json(type="skimmer", **self.skim_status(now))
 
     def skim_status(self, now=None):
         on = bool(self.radio.state.get("skim"))
         return {"on": on, "active": on and str(self.radio.state.get("mode")) in ("CW", "CW-R"),
-                "fc": self.skimmer.fc, "span": SPAN, "channels": len(self.skimmer.channels),
+                "fc": self.skimmer.fc, "span": self.skimmer.span, "wide": self.skimmer.wide,
+                "channels": len(self.skimmer.channels),
                 "rows": self.skimmer.rows(now) if on else []}
 
     def mode_family(self):

@@ -10,12 +10,16 @@ not been seen for IDLE seconds. Channels are at least SPACING Hz apart: two stat
 closer than that can't be told apart by any skimmer.
 
 The Std decoder costs about 0.1 % of one core per channel, so MAX_CHANNELS is far below
-what the CPU allows; the limit is the span the receiver sends.
+what the CPU allows; the limit is the span the receiver sends: +-5 kHz from most KiwiSDRs,
++-10 kHz from those in a 3-channel mode (rx3.wf3, 20.25 kHz audio). MultiSkimmer covers
+the wide ones with two Skimmers, one on each half (kiwi.Subband), +-8.8 kHz in all: the
+receiver's passband is flat to about +-8 kHz and 10 dB down at 9 (measured on OK1XOM).
 """
 import time
 
 import numpy as np
 
+import kiwi
 from cwparse import OverReader
 from decoders import FS, CWDecoder, PitchTracker, keyed_spectrum
 
@@ -41,6 +45,7 @@ class Channel:
         self.copied = 0.0               # last time it printed anything
         self.wpm = 0.0
         self.overs = {}                 # over id -> cleaned text, for the live over
+        self.cq = None                  # (time, call, text, done) of its last over with a CQ in it
 
     @property
     def offset(self):
@@ -62,7 +67,8 @@ class Skimmer:
     SIDE_DB = 12.0          # or if it is this much weaker than that signal has lately been
                             # (clicks sit ~20 dB down; a real neighbour 75 Hz away measured 7 dB down)
 
-    def __init__(self):
+    def __init__(self, span=SPAN):
+        self.span = span        # Hz either side of the centre scanned
         self.channels = []
         self.fc = None
         self.reset_scan()
@@ -85,7 +91,7 @@ class Skimmer:
             keep = []
             for ch in self.channels:
                 off = ch.offset + d
-                if abs(off) <= SPAN:
+                if abs(off) <= self.span:
                     ch.dec.retune(off)
                     ch.anchor += d
                     keep.append(ch)
@@ -126,6 +132,9 @@ class Skimmer:
             ch.overs[o["id"]] = o["text"]
         else:
             ch.overs.pop(o["id"], None)
+        is_cq = "CQ" in o["text"].split() or o.get("cq")
+        if o["done"] and o["text"] and not is_cq:
+            ch.cq = None                # a CQ followed by a contact: no longer calling
         if o["done"]:
             done = ch.overs.pop(o["id"], "")
             if done:
@@ -137,9 +146,12 @@ class Skimmer:
                          or ch.reader.heard.get(call, (0, 0))[0] >= 2)
         if sure:
             ch.call, ch.call_t = call, now
+            # a CQ anywhere: "CQ TEST" sent over and over without a K is all one over
+            if is_cq and call != self.mycall:
+                ch.cq = (now, call, o["text"], o["done"])
 
     def _scan(self, now):
-        f, c, S = keyed_spectrum(self.hist, -SPAN, SPAN)
+        f, c, S = keyed_spectrum(self.hist, -self.span, self.span)
         z = (S - S.mean(axis=0)) / (S.std(axis=0) + 1e-9)     # each bin's keying, normalised
         peaks = []
         for i in range(1, len(c) - 1):
@@ -188,6 +200,18 @@ class Skimmer:
             out.append(ch)
         self.channels = out
 
+    def cqs(self, now=None, within=20.0):
+        """Stations calling CQ now: a channel whose last CQ over (with a sure call) was
+        live or ended within `within` s and whose tone is still there. Hunt picks from these."""
+        now = time.time() if now is None else now
+        out = []
+        for ch in self.channels:
+            if ch.cq and now - ch.cq[0] <= within and now - ch.seen <= self.QUIET:
+                t, call, text, done = ch.cq
+                out.append({"hz": round((self.fc or 0) + ch.offset), "call": call, "snr": round(ch.snr),
+                            "wpm": round(ch.wpm), "age": round(now - t, 1), "done": done, "text": text[-80:]})
+        return out
+
     def rows(self, now=None):
         """One row per channel that has copied something: RF Hz, call, WPM, contrast,
         seconds since it last printed, and its recent copy (live over last)."""
@@ -202,3 +226,89 @@ class Skimmer:
                         "call": ch.call, "spotted": ch.call in self.hints, "wpm": round(ch.wpm),
                         "snr": round(ch.snr), "age": round(now - ch.copied), "text": text.lstrip(" |")})
         return out
+
+
+class MultiSkimmer:
+    """The skimmer for whatever I/Q rate the receiver sends: one Skimmer at FS (+-4.8 kHz),
+    or at 2 FS (a wideband receiver) two, on 12 kHz halves centred HALF below and above
+    the dial, each scanning +-HALF: together +-2 HALF. Same interface as Skimmer."""
+    HALF = 4400
+
+    def __init__(self):
+        self.rate, self.parts = None, []        # [(centre offset Hz, Subband or None, Skimmer)]
+        self.fc = None
+        self._hints, self._mycall = {}, ""
+
+    @property
+    def wide(self):
+        return self.rate is not None and self.rate > FS
+
+    @property
+    def span(self):
+        return 2 * self.HALF if self.wide else SPAN
+
+    @property
+    def channels(self):
+        return [ch for _, _, sk in self.parts for ch in sk.channels]
+
+    @property
+    def hints(self):
+        return self._hints
+
+    @hints.setter
+    def hints(self, h):
+        self._hints = h
+        for _, _, sk in self.parts:
+            sk.hints = h
+
+    @property
+    def mycall(self):
+        return self._mycall
+
+    @mycall.setter
+    def mycall(self, c):
+        self._mycall = c
+        for _, _, sk in self.parts:
+            sk.mycall = c
+
+    def clear(self):
+        self.rate, self.parts, self.fc = None, [], None
+
+    def feed(self, iq, fc, rate=FS, now=None):
+        if rate != self.rate:
+            self.rate = rate
+            if rate > FS:
+                self.parts = [(c, kiwi.Subband(c), Skimmer(self.HALF)) for c in (-self.HALF, self.HALF)]
+            else:
+                self.parts = [(0, None, Skimmer())]
+            self.hints, self.mycall = self._hints, self._mycall
+        self.fc = fc
+        for c, sub, sk in self.parts:
+            sk.feed(sub(iq) if sub else iq, fc + c, now)
+
+    def retune(self, fc):
+        for c, _, sk in self.parts:
+            sk.retune(fc + c)
+        self.fc = fc
+
+    def cqs(self, now=None, within=20.0):
+        out = []
+        for r in sorted((r for _, _, sk in self.parts for r in sk.cqs(now, within)), key=lambda r: r["hz"]):
+            if out and r["hz"] - out[-1]["hz"] < Skimmer.SPACING:   # the seam
+                if r["snr"] > out[-1]["snr"]:
+                    out[-1] = r
+                continue
+            out.append(r)
+        return out
+
+    def rows(self, now=None):
+        out = []
+        for r in sorted((r for _, _, sk in self.parts for r in sk.rows(now)), key=lambda r: r["hz"]):
+            # one signal on the seam, seen by both halves: keep the half it is further inside
+            # (r["offset"] is still from that half's centre)
+            if out and r["hz"] - out[-1]["hz"] < Skimmer.SPACING:
+                if abs(r["offset"]) < abs(out[-1]["offset"]):
+                    out[-1] = r
+                continue
+            out.append(r)
+        return [dict(r, offset=r["hz"] - (self.fc or 0)) for r in out]

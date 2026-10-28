@@ -60,7 +60,7 @@ waterfall, Listen, CW spots and the NCDXF beacon monitor all work on it.
 - **One connection per IP**: close the receiver's browser tab first. Some receivers stream for ~10 s and then send
   "all N channels in use" (Hamburg did on 2026-10-28 after many test connections); the driver then backs off 60 s,
   doubling to 5 min.
-- **Skimmer** (tile shown for KiwiSDR in CW / CW-R; `skimmer.py`): decodes every CW signal within ±4.8 kHz of the dial
+- **Skimmer** (tile shown for KiwiSDR in CW / CW-R; `skimmer.py`): decodes every CW signal within ±4.8 kHz of the dial (±8.8 kHz on wideband receivers, below)
   at once. Ticking it switches the connection to I/Q (±5 kHz; the Kiwi takes the switch mid-stream), and the speaker
   and main decoder audio are then made locally from the I/Q (`kiwi.IQDemod`: same passband and pitch, ~67 dB image
   rejection). Every 0.5 s it scans the last 2 s for keyed tones; a tone found in two scans in a row gets a channel: a
@@ -73,6 +73,15 @@ waterfall, Listen, CW spots and the NCDXF beacon monitor all work on it.
   with five stations (two 70 Hz apart) every call and speed right, 1.7 % of one core; on 87 s of real 40 m I/Q from De
   Kiel the channels' copy matched a single decoder's on the same signals word for word; live, the whole process
   (receive, demod, skimmer) used ~20 % of one core. It runs in its own thread, so a busy band doesn't stall the page.
+  - **Wideband receivers** (status `rx3.wf3`, 3 channels at 20.25 kHz audio; 20 of 683 public Kiwis on 2026-10-28) send
+    I/Q ±10 kHz, delivered at 24 kHz. The skimmer then covers **±8.8 kHz**: two skimmers, each on a 12 kHz half
+    centred 4.4 kHz below and above the dial (`kiwi.Subband`: mix, 191-tap low-pass, decimate by 2; > 60 dB rejection
+    of the other half and of aliases). A signal on the seam that both halves copy is shown once. Why not ±10 kHz:
+    measured on OK1XOM, the passband is flat to about ±8 kHz, +3 dB at 8–9 kHz and 8 dB down at 9–10 kHz. The
+    speaker and main decoder use the middle 12 kHz (`Subband(0)`). The tile says "wideband receiver" when this is
+    on. Measured: synthetic 24 kHz I/Q with stations at −8.2, −5.6, −0.06 (the seam), +4.4 and +7.7 kHz gave every
+    call and speed right; live on OK1XOM 20 m, copy from 3 to 8.6 kHz below the dial; the whole process used ~28 %
+    of one core (the skimmer itself ~2 %).
 
 ## PC clock
 The beacon monitor (10 s slots) and FT8/FT4 need the PC clock NTP-synchronised. The server checks it at startup and
@@ -175,6 +184,16 @@ Makes a complete CW contact by itself using the local gpt-oss model on llama.cpp
   and answer the first CQ heard. The call is taken from the copy in code (sent twice or after DE, valid prefix);
   CQ DX from your own country and CQ EU/NA/JA... not meant for you are skipped, as is a station that does not come back.
   The selector next to Hunt picks **All stations** or **DX only** (callers in other countries).
+  - **Hunt with the skimmer** (KiwiSDR, skimmer ticked): Hunt listens to every skimmer channel, not just the main
+    decoder. Stations calling CQ (a CQ in an over whose call is sure, the tone still there, within 20 s; a CQ that
+    turned into a contact is dropped) are listed in the robot panel: kHz, call, country, dB, WPM, and why one can't
+    be answered (CQ EU from Asia, DX-only hunt, tried with no answer in the last 5 min). The strongest answerable
+    one is picked: the radio is tuned onto it (dial on its carrier, main decoder and AFC on the pitch). If the CQ is
+    still going, Hunt waits for it to end, heard by the main decoder (CQ and the call), or the main decoder hears
+    the tail and the skimmer saw the CQ over close. Then it calls twice, and goes to the next station if there is
+    no reply. Live, dry run, 40 m on OK1XOM: it listed GM0GMN, W0EAS and M0KTZ, tuned to and answered GM0GMN
+    (39 dB, the strongest), then moved on down the list; it declined one channel where the main decoder heard a
+    different station (OK1DOC/P) from the one the skimmer had named.
   Only the robot's modes answer: while idle it does not react to anything the decoder prints.
 - Each received over is read first by a rule-based reader (`cwparse.py`: who is calling, their RST, name, QTH,
   repeat requests, 73), which takes well under a millisecond. It handles merged doubles (IGORIGOR) and votes out

@@ -41,6 +41,7 @@ RECEIVERBOOK = "https://www.receiverbook.de/map?type=kiwisdr"
 USER = "cw_bot"     # name shown in the receiver's user list
 FS = 12000
 IQ_PASSBAND = (-5000, 5000)     # Hz around the dial in I/Q mode
+WIDE_IQ_HALF = 10000            # Hz either side in I/Q on a 20.25 kHz (rx3.wf3) receiver
 
 # (lat_min, lat_max, lon_min, lon_max). Europe has the densest CW QSO traffic.
 REGIONS = {
@@ -205,6 +206,27 @@ class IQDemod:
         return self.bp(y)
 
 
+class Subband:
+    """A 12 kHz slice of wideband (2 FS) I/Q: moved down by center_hz, low-passed to
+    +-CUTOFF and decimated by 2. Keeps state across blocks of any length. The sharp
+    filter also removes what the resampling to 2 FS puts above the receiver's +-10 kHz."""
+    CUTOFF = 4900
+
+    def __init__(self, center_hz, taps=191):
+        self.center, self.phase, self.skip = float(center_hz), 0.0, 0
+        self.h = firwin(taps, self.CUTOFF, fs=2 * FS)
+        self.zi = np.zeros(taps - 1, complex)
+
+    def __call__(self, iq):
+        w = -2 * np.pi * self.center / (2 * FS)
+        y = iq * np.exp(1j * (self.phase + w * np.arange(len(iq))))
+        self.phase = (self.phase + w * len(iq)) % (2 * np.pi)
+        y, self.zi = lfilter(self.h, 1, y, zi=self.zi)
+        out = y[self.skip::2]
+        self.skip = (self.skip + len(y)) % 2       # keep every other sample across block edges
+        return out.astype(np.complex64)
+
+
 class Resampler:
     """Stateful linear interpolation from the receiver's sample rate (e.g. 11998.9 or
     20250 Hz) to FS, real or complex. The passband is well below either Nyquist."""
@@ -234,8 +256,9 @@ class _Socket:
     timestamp `ts` count as one user, like a browser tab."""
     STREAM = ""
 
-    def __init__(self, host, port, ts=None, user=USER):
+    def __init__(self, host, port, ts=None, user=USER, wide=False):
         self.host, self.port, self.user = host, port, user
+        self.wide = wide                # the /wb endpoint: a wideband channel, where the receiver has them
         self.ts = ts or int(time.time())
         self.ws = self.loop = None
         self.ready = False              # set up: commands go out at once from here on
@@ -247,7 +270,7 @@ class _Socket:
     async def run(self):
         """Stream until the connection ends; raises KiwiError with the receiver's reason."""
         self.loop = asyncio.get_running_loop()
-        url = f"ws://{self.host}:{self.port}/{self.ts}/{self.STREAM}"
+        url = f"ws://{self.host}:{self.port}{'/wb' if self.wide else ''}/{self.ts}/{self.STREAM}"
         timeout = aiohttp.ClientTimeout(total=None, sock_connect=10)
         async with aiohttp.ClientSession(timeout=timeout) as s:
             async with s.ws_connect(url, max_msg_size=0, headers={"User-Agent": "cw_bot"}) as ws:
@@ -297,14 +320,28 @@ class Client(_Socket):
     on_samples(x, rssi_dbm): x at FS, float32 audio, or complex64 in mode "iq"."""
     STREAM = "SND"
 
-    def __init__(self, host, port, on_samples, user=USER, ts=None):
-        super().__init__(host, port, ts, user)
+    def __init__(self, host, port, on_samples, user=USER, ts=None, wide=False):
+        super().__init__(host, port, ts, user, wide)
         self.on_samples = on_samples
         self.mod = ("usb", 300, 2700, 7030.0)        # mode, low cut, high cut (Hz), dial kHz
         self.agc = (True, 1000, 50)                  # on, decay ms, manual gain dB
-        self.resample = None
+        self.resample = self.resample_iq = None
+        self.rate = None                             # the receiver's audio rate, once it says
+        self.iq_rate = FS                            # I/Q is delivered at this rate: FS, or 2 FS when wideband
+
+    @property
+    def wideband(self):
+        """A receiver in a 3-channel mode (rx3.wf3) sends 20.25 kHz audio: in I/Q that is
+        +-10 kHz, delivered at 2 FS."""
+        return bool(self.rate and self.rate > 1.5 * FS)
+
+    def iq_half(self):
+        return WIDE_IQ_HALF if self.wideband else IQ_PASSBAND[1]
 
     def tune(self, mode, lo, hi, khz):
+        """In mode "iq" lo/hi are ignored: the widest passband the receiver's rate allows."""
+        if mode == "iq":
+            lo, hi = -self.iq_half(), self.iq_half()
         self.mod = (mode, int(lo), int(hi), float(khz))
         self._send("SET mod=%s low_cut=%d high_cut=%d freq=%.3f" % self.mod)
 
@@ -321,12 +358,17 @@ class Client(_Socket):
         if k == "audio_rate":
             await self.ws.send_str(f"SET AR OK in={v} out=44100")
         elif k == "sample_rate":
+            self.rate = float(v)
+            self.iq_rate = 2 * FS if self.wideband else FS
+            if self.mod[0] == "iq":
+                self.mod = ("iq", -self.iq_half(), self.iq_half(), self.mod[3])
             for m in ("SET squelch=0 max=0", "SET genattn=0", "SET gen=0 mix=-1", f"SET ident_user={self.user}",
                       "SET mod=%s low_cut=%d high_cut=%d freq=%.3f" % self.mod,
                       "SET agc=%d hang=0 thresh=-100 slope=6 decay=%d manGain=%d" % self.agc,
                       "SET compression=0", "SET keepalive"):
                 await self.ws.send_str(m)
             self.resample = Resampler(float(v))
+            self.resample_iq = Resampler(float(v), self.iq_rate)
             self.ready = True
 
     def _data(self, tag, b):
@@ -339,9 +381,9 @@ class Client(_Socket):
             return
         if flags & 0x08:            # stereo = I/Q, after 10 bytes of GPS timestamp
             v = np.frombuffer(data[10:], ">i2").astype(np.float32) / 32768
-            x = v[0::2] + 1j * v[1::2]
-        else:
-            x = np.frombuffer(data, ">i2").astype(np.float32) / 32768
+            self.on_samples(self.resample_iq(v[0::2] + 1j * v[1::2]), rssi)
+            return
+        x = np.frombuffer(data, ">i2").astype(np.float32) / 32768
         self.on_samples(self.resample(x), rssi)
 
 

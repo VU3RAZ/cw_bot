@@ -561,7 +561,8 @@ function renderSkimmer(m) {
   $('skOn').checked = m.on;
   const rows = $('skCalls').checked ? m.rows.filter((r) => r.call) : m.rows;
   $('skInfo').textContent = !m.on ? 'off' : !m.active ? 'on, waiting for CW / CW-R mode'
-    : `${rows.length} signals copied · ${m.channels} tracked · ${((m.fc - m.span) / 1e3).toFixed(1)}–${((m.fc + m.span) / 1e3).toFixed(1)} kHz`;
+    : `${rows.length} signals copied · ${m.channels} tracked · ${((m.fc - m.span) / 1e3).toFixed(1)}–${((m.fc + m.span) / 1e3).toFixed(1)} kHz`
+      + (m.wide ? ' · wideband receiver' : '');
   const body = $('skBody'); body.textContent = '';
   if (m.on && m.active && !rows.length) {
     const td = body.insertRow().insertCell(); td.colSpan = 6; td.className = 'hint';
@@ -770,6 +771,20 @@ function renderRobot(st) {
   }
   robotInQso = st.in_qso;
   $('rbCq').disabled = $('rbAnswer').disabled = $('rbPath').disabled = $('rbHunt').disabled = st.active;
+  renderHunt(st);
+}
+function renderHunt(st) {
+  const c = st.cands || [];
+  $('rbHuntList').classList.toggle('on', c.length > 0);
+  const body = $('rbHuntBody'); body.textContent = '';
+  for (const r of c) {
+    const tr = body.insertRow();
+    tr.className = r.call === st.pick ? 'pick' : r.why ? 'skip' : '';
+    tr.title = `${r.text}${r.directed ? ` · CQ ${r.directed}` : ''} · ${r.why || (r.call === st.pick ? 'being answered' : 'answerable')}`;
+    for (const v of [(r.hz / 1e3).toFixed(2), r.call, r.country, r.snr, r.wpm || '',
+      r.call === st.pick ? 'answering' : r.why || '']) tr.insertCell().textContent = v;
+    tr.cells[1].className = 'call';
+  }
 }
 function robotEvent(m) {
   const el = $('rbLog');
