@@ -34,6 +34,7 @@ function connect() {
     else if (m.type === 'beacons') renderBeacons(m.data);
     else if (m.type === 'error' || m.type === 'notice') toast(m.msg);
     else if (m.type === 'clock') renderClock(m);
+    else if (m.type === 'kiwi_list') renderKiwiList(m);
   };
 }
 function send(obj) {
@@ -184,9 +185,12 @@ const AF_MAX = 4000;
 const af = {
   wf: new Waterfall($('afWf'), 150), floor: null,
   push(bins) {
-    // auto floor: running 30th percentile of the 100-3000 Hz part of the row
+    // auto floor: running 30th percentile of the 100-3000 Hz part of the row, leaving out digital
+    // silence (a KiwiSDR's audio outside a narrow filter), which would put the floor at zero
     const hzPerBin = AF_MAX / bins.length;
-    const sorted = Array.from(bins.subarray(100 / hzPerBin | 0, 3000 / hzPerBin | 0)).sort((a, b) => a - b);
+    const all = Array.from(bins.subarray(100 / hzPerBin | 0, 3000 / hzPerBin | 0));
+    const live = all.filter((v) => v > 5);
+    const sorted = (live.length >= all.length / 10 ? live : all).sort((a, b) => a - b);
     const p = sorted[Math.floor(sorted.length * 0.3)];
     this.floor = this.floor == null ? p : this.floor * 0.9 + p * 0.1;
     const k = +$('afContrast').value, fl = this.floor;
@@ -365,7 +369,8 @@ let caps = { name: 'IC-7300', scope: true, filters: { 1: 'FIL1', 2: 'FIL2', 3: '
 let radiosInfo = null;
 function renderRadios(m) {
   radiosInfo = m; caps = m.caps;
-  $('radioSel').innerHTML = m.radios.map((r) => `<option value="${r.name}">${r.name}${r.connected ? '' : ' (not detected)'}</option>`).join('');
+  $('radioSel').innerHTML = m.radios.map((r) => `<option value="${r.name}">${r.name}`
+    + `${r.network || r.connected ? '' : ' (not detected)'}</option>`).join('');
   $('radioSel').value = m.current;
   document.title = `${caps.name} Web`;
   document.querySelectorAll('#filters button').forEach((b) => { b.textContent = caps.filters[b.dataset.fil]; b.title = caps.filter_help || ''; });
@@ -373,8 +378,62 @@ function renderRadios(m) {
   $('rfNote').hidden = caps.scope;
   $('rfNote').textContent = caps.notes.join(' ');
   $('rfWrap').classList.toggle('no-scope', !caps.scope);
+  document.body.classList.toggle('rx-only', !!caps.rx_only);
   renderState({ mode: 1, preamp: 1 });
+  if (m.kiwi && !$('kiwiRegion').options.length) {
+    $('kiwiRegion').innerHTML = m.kiwi.regions.map((r) => `<option value="${r}">${r}</option>`).join('');
+    $('kiwiRegion').value = m.kiwi.region;
+  }
+  renderKiwiBox();
+  if (m.current === 'KiwiSDR' && !(m.kiwi || {}).receiver) openKiwiPanel();
 }
+
+// ------------------------------------------------------------ KiwiSDR receivers
+let kiwiList = null;      // last kiwi_list reply
+function renderKiwiBox() {
+  const on = !!radiosInfo && radiosInfo.current === 'KiwiSDR';
+  $('kiwiBox').hidden = !on;
+  if (!on) { $('kiwiPanel').hidden = true; return; }
+  const rx = state.receiver;
+  $('kiwiBtn').textContent = (rx ? (rx.name || rx.url).split('|')[0].trim().slice(0, 40) : 'Choose receiver') + ' ▾';
+  $('kiwiBtn').title = rx ? `${rx.name}\n${rx.url}\n${rx.antenna || ''} - click to choose another` : 'Public KiwiSDR receivers: click to choose';
+  $('kiwiStatus').textContent = state.kiwi_status || '';
+}
+function openKiwiPanel(refresh) {
+  $('kiwiPanel').hidden = false;
+  if (refresh || !kiwiList || kiwiList.region !== $('kiwiRegion').value || (!kiwiList.receivers && !kiwiList.loading))
+    send({ cmd: 'kiwi_list', region: $('kiwiRegion').value, refresh: !!refresh });
+  else renderKiwiList(kiwiList);
+}
+function renderKiwiList(m) {
+  if (m.region !== $('kiwiRegion').value) return;
+  kiwiList = m;
+  if (m.loading) { $('kiwiInfo').textContent = `asking every ${m.region} receiver for its status (up to a minute)…`; return; }
+  $('kiwiInfo').textContent = `${m.receivers.length} usable · checked ${fmtAge(m.age)} ago`;
+  const body = $('kiwiBody'); body.textContent = '';
+  if (!m.receivers.length) {
+    const td = body.insertRow().insertCell();
+    td.colSpan = 7; td.className = 'hint'; td.textContent = 'No usable receiver here right now (80-20 m, online, antenna connected). Try another region.';
+  }
+  const cur = (state.receiver || {}).url;
+  for (const r of m.receivers) {
+    const tr = document.createElement('tr');
+    if (r.url === m.recommended) tr.className = 'rec';
+    if (r.url === cur) tr.classList.add('cur');
+    if (r.refused) tr.classList.add('refused');
+    tr.title = `${r.loc}\n${r.url}\n` + (r.refused ? `turned us away lately: ${r.refused}` : 'click to listen');
+    const mark = (r.url === cur ? '● ' : '') + (r.url === m.recommended ? '★' : '');
+    for (const v of [mark, r.name || r.loc, r.antenna, `${r.snr} dB`, r.free, r.time_limited ? 'yes' : 'none', r.km ?? '']) {
+      const td = document.createElement('td'); td.textContent = v; tr.appendChild(td);
+    }
+    tr.onclick = () => { send({ cmd: 'kiwi_select', url: r.url }); $('kiwiPanel').hidden = true; toast(`connecting to ${r.name || r.url}`); };
+    body.appendChild(tr);
+  }
+}
+$('kiwiBtn').onclick = () => ($('kiwiPanel').hidden ? openKiwiPanel() : ($('kiwiPanel').hidden = true));
+$('kiwiClose').onclick = () => { $('kiwiPanel').hidden = true; };
+$('kiwiRefresh').onclick = () => openKiwiPanel(true);
+$('kiwiRegion').onchange = () => openKiwiPanel();
 $('radioSel').onchange = () => {
   const name = $('radioSel').value;
   if (radiosInfo) $('radioSel').value = radiosInfo.current;   // shown again once the server has switched
@@ -382,6 +441,7 @@ $('radioSel').onchange = () => {
 };
 
 function renderState(ch) {
+  if ('receiver' in ch || 'kiwi_status' in ch) renderKiwiBox();
   if ('freq' in ch) {
     renderFreq();
     const b = bandOf(state.freq);

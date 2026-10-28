@@ -17,7 +17,7 @@ select, input[type=text], input[type=number], input:not([type]) { background: va
   border-radius: 5px; padding: 3px 6px; }
 input[type=range] { accent-color: var(--accent); }
 
-header { display: flex; align-items: center; gap: 22px; padding: 8px 14px;
+header { position: relative; display: flex; align-items: center; gap: 22px; padding: 8px 14px;
   background: var(--panel); border-bottom: 1px solid var(--line); flex-wrap: wrap; }
 .brand { font-weight: 700; letter-spacing: .5px; display: flex; align-items: center; gap: 8px; }
 .dot { width: 10px; height: 10px; border-radius: 50%; background: var(--bad); display: inline-block; }
@@ -210,3 +210,25 @@ body.radio-locked .cwsend { opacity: 0.45; }
 #radioSel { width: 104px; }
 @media (max-width: 1250px) { header { gap: 10px; } .meter { width: 170px; } .freq { font-size: 32px; }
   .listen input { width: 60px; } }
+
+/* KiwiSDR receiver picker */
+.kiwi-box { display: inline-flex; align-items: center; gap: 8px; font-weight: 400; letter-spacing: 0; }
+.kiwi-btn { max-width: 320px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+#kiwiStatus { max-width: 360px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.kiwi-panel { position: absolute; top: 100%; left: 14px; z-index: 20; width: min(820px, calc(100vw - 32px));
+  background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 8px;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, .5); display: flex; flex-direction: column; gap: 6px; }
+.kiwi-panel[hidden] { display: none; }
+.kiwi-close { margin-left: auto; }
+.dec-out.kiwi-table { height: auto; max-height: 360px; font: 13px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif; }
+.kiwi-table tbody tr { cursor: pointer; }
+.kiwi-table td:nth-child(2) { max-width: 330px; overflow: hidden; text-overflow: ellipsis; }
+.kiwi-table td:nth-child(3) { max-width: 190px; overflow: hidden; text-overflow: ellipsis; }
+.kiwi-table td:last-child { width: auto; }
+.kiwi-table tr.rec td { color: var(--accent); background: #2a1f0b; font-weight: 600; }
+.kiwi-table tr.rec td:first-child { box-shadow: inset 3px 0 0 var(--accent); }
+.kiwi-table tr.cur td:first-child { color: var(--ok); }
+.kiwi-table tr.refused td { color: var(--dim); text-decoration: line-through; }
+.kiwi-rec-key { color: var(--accent); font-weight: 600; }
+body.rx-only .group.tx { opacity: .4; pointer-events: none; }
+body.rx-only .dry { outline: 1px dashed var(--accent); border-radius: 4px; }

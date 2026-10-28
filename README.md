@@ -16,7 +16,8 @@ To keep it running after the terminal closes, with a memory cap, run it as a sys
     systemctl --user restart cw-bot-server      # or stop
 
 ## Radios
-The dropdown at the top left picks the radio: **IC-7300** (CI-V) or **Yaesu FTDX10** (CAT, `ftdx10.py`).
+The dropdown at the top left picks the radio: **IC-7300** (CI-V), **Yaesu FTDX10** (CAT, `ftdx10.py`) or a public
+**KiwiSDR** (see below).
 Radios are **detected by their USB ids** at startup and every 2 s while running (`rig.detect()`): IC-7300 = CP2102
 `10c4:ea60` whose USB serial number Icom sets to "IC-7300 …"; FTDX10 = CP2105 `10c4:ea70`, interface 0 (Enhanced port,
 CAT; other Yaesu rigs use the CP2105 too, so the driver also checks the CAT ID answer `ID0761`). The dropdown marks
@@ -35,6 +36,30 @@ FTDX10 notes (written from the FTDX10 CAT manual; tested against a simulated rad
   and played (`KY1`) chunk by chunk; prosigns like `<KN>` go out as two letters.
 - S-meter / SWR use Hamlib's Yaesu calibration (approximate).
 - CW is CW-U (CW-R = CW-L), RTTY is RTTY-L (RTTY-R = RTTY-U), USB/LSB + DATA = DATA-U/DATA-L.
+
+## KiwiSDR (public web receivers)
+**KiwiSDR** in the radio dropdown listens through a public KiwiSDR instead of a radio (`kiwisdr.py`): receive only, so
+TRANSMIT is greyed out, PTT/TUNE/CW sending are refused and the robot runs only as a Dry run. Decoders, the audio
+waterfall, Listen, CW spots and the NCDXF beacon monitor all work on it.
+- The button beside the dropdown opens the **public receiver list** for a region (asks every receiver's status page,
+  up to a minute; kept 10 min). The **recommended** one, ranked by spare slots, no time limit, then HF SNR, is
+  highlighted in the accent colour; a receiver that turned us away in the last 30 min is struck through and never
+  recommended. Click a row to listen. The choice and region are saved in `settings.json` (`kiwi`, `kiwi_region`).
+- The receiver is streamed in-process over its websocket (`kiwi.Client`, uncompressed 12 kHz), so tuning and mode
+  changes don't reconnect. Modes behave like the IC-7300: in CW the dial is the signal's frequency, heard at the 600 Hz
+  pitch; RTTY puts mark on the dial at 2125 Hz. WIDE/MID/NAR = 1.2 kHz / 500 / 250 Hz in CW, 3.0 / 2.4 / 1.8 kHz in
+  SSB. AGC FAST/MID/SLOW and NB are the receiver's; no preamp, attenuator or NR. The S-meter is the receiver's RSSI
+  (S9 = -73 dBm).
+- **Panadapter** = the receiver's own waterfall (`kiwi.Waterfall`, a second websocket opened with the audio's timestamp,
+  so the receiver counts one user). Span picks the zoom that covers it (±25 kHz → 58.6 kHz wide); receivers cap the
+  zoom (De Kiel: 14.6 kHz at most), and the axis shows what was actually sent. Center follows the dial; Fixed stays put
+  until the dial leaves the view. Fast/Mid/Slow = Kiwi waterfall speed 4/3/2 (about 7-9 frames/s at Fast). Levels are
+  mapped to the IC-7300's scope scale (-130 dBm = 0, 1.6 per dB), so Floor/Contrast work the same. Some receivers have
+  fewer waterfall than audio channels (3 vs 8): if it is refused, audio carries on, the status line says so and it
+  retries every 30 s.
+- **One connection per IP**: close the receiver's browser tab first. Some receivers stream for ~10 s and then send
+  "all N channels in use" (Hamburg did on 2026-10-28 after many test connections); the driver then backs off 60 s,
+  doubling to 5 min.
 
 ## PC clock
 The beacon monitor (10 s slots) and FT8/FT4 need the PC clock NTP-synchronised. The server checks it at startup and
@@ -134,6 +159,7 @@ Retune it whenever the decoder changes or copy looks worse than it should:
 python3 kiwi.py europe                          # usable KiwiSDRs in a region, best first
 python3 corpus.py capture --call N0CALL --minutes 60
 python3 corpus.py stats                         # how much audio / readable copy there is
+python3 kiwi.py record HOST:8073 7024.5 60 --iq # one recording to WAV: USB audio, or raw I/Q with --iq
 python3 cwtune.py --dry-run                     # search and report; drop --dry-run to save
 ```
 
@@ -146,6 +172,10 @@ python3 cwtune.py --dry-run                     # search and report; drop --dry-
   listens in a 300-2700 Hz passband and follows the strongest keyed tone.
 - **Corpus**, in `logs/corpus/`: `audio/*.raw` (12 kHz mono s16le) and a `.json` per recording (receiver, dial, target
   spot, pitch track), plus `copy-*.jsonl` with the decoded copy. Raw audio is about 86 MB per hour.
+- **I/Q** (`capture --iq`): each dwell also keeps the receiver's raw I/Q, `audio/*.iq`, 12 kHz s16le interleaved I, Q,
+  -5..+5 kHz around the dial (about 173 MB per hour). The `.raw` is then demodulated from it (`kiwi.IQToUSB`, complex
+  band-pass 300-2700 Hz, 76 dB image rejection), so `cwtune.py` works the same. `kiwi.py record --iq` writes a stereo
+  WAV (left I, right Q).
 - **Tuning** (`cwtune.py`): it fits the tone filter width, squelch, envelope smoothing, glitch length, key hysteresis and dash/character/word gap lengths
   by replaying the recorded audio.
   - Copy is scored for readability: QSO words, valid calls and reports count; `*` characters and merged words cost.
@@ -158,5 +188,5 @@ python3 cwtune.py --dry-run                     # search and report; drop --dry-
 - Tests: `python3 -m pytest -q tests`. Synthetic CW comes from `cwsynth.py`.
 
 Files: `radio.py` (IC-7300 CI-V), `ftdx10.py` (FTDX10 CAT), `rig.py` (radio detection, port + audio pairing), `clock.py` (NTP check), `decoders.py` (DSP), `cwhmm.py` (HMM CW decoder), `robot.py` (CW robot), `spots.py` (DX spots),
-`pathcheck.py` (who heard us), `beacons.py` (NCDXF beacon monitor), `beaconlog.py` + `spaceweather.py` (its JSONL propagation log), `geo.py` (cty.dat prefixes, grid/distance; `vendor/cty.dat`), `cwparse.py` (rule-based over reader), `kiwi.py` + `corpus.py` + `cwtune.py` (KiwiSDR capture and decoder tuning), `server.py`
+`pathcheck.py` (who heard us), `beacons.py` (NCDXF beacon monitor), `beaconlog.py` + `spaceweather.py` (its JSONL propagation log), `geo.py` (cty.dat prefixes, grid/distance; `vendor/cty.dat`), `cwparse.py` (rule-based over reader), `kiwi.py` + `corpus.py` + `cwtune.py` (KiwiSDR capture and decoder tuning), `kiwisdr.py` (KiwiSDR as a receive-only radio), `server.py`
 (aiohttp + websocket), `static/` (UI).

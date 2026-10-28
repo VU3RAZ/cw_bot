@@ -8,7 +8,27 @@
 </head>
 <body>
 <header>
-  <div class="brand"><span id="conn" class="dot"></span><select id="radioSel" title="Radio to control (switching is refused while the robot or beacon monitor runs)"></select></div>
+  <div class="brand"><span id="conn" class="dot"></span><select id="radioSel" title="Radio to control (switching is refused while the robot or beacon monitor runs)"></select>
+    <span id="kiwiBox" class="kiwi-box" hidden>
+      <button id="kiwiBtn" class="small kiwi-btn" title="Public KiwiSDR receivers: click to choose">Choose receiver ▾</button>
+      <span id="kiwiStatus" class="hint"></span>
+    </span>
+  </div>
+  <div id="kiwiPanel" class="kiwi-panel" hidden>
+    <div class="dec-head">
+      <b>Public KiwiSDRs</b>
+      <select id="kiwiRegion" title="Where the receiver is"></select>
+      <button class="small" id="kiwiRefresh" title="Ask every receiver in the region again">Refresh</button>
+      <span id="kiwiInfo" class="hint"></span>
+      <button class="small kiwi-close" id="kiwiClose" title="Close">✕</button>
+    </div>
+    <div class="dec-out table kiwi-table">
+      <table><thead><tr><th></th><th>Receiver</th><th>Antenna</th><th>SNR</th><th>Free</th><th>Limit</th><th>km</th></tr></thead>
+      <tbody id="kiwiBody"></tbody></table>
+    </div>
+    <div class="hint"><span class="kiwi-rec-key">★ recommended</span>: spare slots, no time limit, best HF SNR (from each receiver's
+      status page). Struck through: turned us away in the last 30 min. Click a row to listen. A Kiwi takes one connection per IP: close its tab in your browser first.</div>
+  </div>
   <div id="freq" class="freq" title="Mouse wheel over a digit to tune it; click to type"></div>
   <input id="freqInput" class="freq-input" hidden>
   <div class="mode-badge" id="modeBadge">—</div>

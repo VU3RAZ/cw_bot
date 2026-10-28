@@ -1,7 +1,7 @@
 """Record real CW traffic from public KiwiSDRs, for tuning the decoder (cwtune.py)
 and testing the over reader (cwparse.py).
 
-  python3 corpus.py capture --call N0CALL [--region europe] [--minutes 60] [--bands 40 30 20]
+  python3 corpus.py capture --call N0CALL [--region europe] [--minutes 60] [--bands 40 30 20] [--iq]
   python3 corpus.py stats
 
 capture picks the best KiwiSDR in the region (kiwi.find), then repeatedly chooses a
@@ -13,6 +13,8 @@ tone in the 300-2700 Hz passband.
 
 Output in logs/corpus/:
   audio/<utc>_<khz>_<call>.raw   12 kHz mono s16le, one file per dwell
+  audio/<same>.iq                with --iq: the raw I/Q as well, 12 kHz s16le interleaved I, Q,
+                                 -5..+5 kHz around the dial (the .raw is demodulated from it)
   audio/<same>.json              receiver, dial, target spot and pitch track
   copy-YYYYMMDD.jsonl            one line per burst of decoded copy, with its audio offset
 """
@@ -65,8 +67,8 @@ def utcnow():
 
 
 class Capture:
-    def __init__(self, call, region, bands, rx=None):
-        self.region, self.bands, self.fixed_rx = region, bands, rx
+    def __init__(self, call, region, bands, rx=None, iq=False):
+        self.region, self.bands, self.fixed_rx, self.iq = region, bands, rx, iq
         self.visited, self.bad_rx = {}, set()
         self.loop = asyncio.new_event_loop()
         threading.Thread(target=self.loop.run_forever, daemon=True).start()
@@ -107,14 +109,22 @@ class Capture:
                 "mode": "usb", "passband_hz": [300, 2700], "target": {k: spot.get(k) for k in
                 ("call", "khz", "band", "snr", "wpm", "why")}, "start_utc": start.isoformat(),
                 "fs": FS, "format": "s16le", "pitch_track": []}
+        if self.iq:
+            meta.update(iq=name + ".iq", iq_format="s16le interleaved I, Q", iq_passband_hz=list(kiwi.IQ_PASSBAND))
         dec, hist, nbytes, copied, burst = CWDecoder(DIAL_OFFSET * 1000), np.zeros(0, np.float32), 0, "", None
         last_retune = 0.0
-        st = kiwi.Stream(rx, dial, DWELL)
+        st = kiwi.Stream(rx, dial, DWELL, iq=self.iq)
+        usb = kiwi.IQToUSB() if self.iq else None
+        iqf = open(os.path.join(AUDIO, name + ".iq"), "wb") if self.iq else None
         with open(os.path.join(AUDIO, name + ".raw"), "wb") as raw:
             while True:
-                data = st.read(1200)                    # 50 ms
+                data = st.read(2400 if self.iq else 1200)      # 50 ms
                 if not data:
                     break
+                if self.iq:
+                    iqf.write(data)
+                    x = usb(kiwi.iq_samples(data))
+                    data = (np.clip(x, -1, 1) * 32767).astype("<i2").tobytes()
                 raw.write(data)
                 nbytes += len(data)
                 t = nbytes / 2 / FS
@@ -144,6 +154,8 @@ class Capture:
                     break
         if burst:
             self.save_burst(burst)
+        if iqf:
+            iqf.close()
         err = st.close()
         meta["seconds"] = round(nbytes / 2 / FS, 1)
         with open(os.path.join(AUDIO, name + ".json"), "w") as f:
@@ -186,7 +198,7 @@ def stats():
     metas = [json.load(open(p)) for p in sorted(glob.glob(os.path.join(AUDIO, "*.json")))]
     bursts = [json.loads(l) for p in sorted(glob.glob(os.path.join(CORPUS, "copy-*.jsonl"))) for l in open(p)]
     secs = sum(m.get("seconds", 0) for m in metas)
-    size = sum(os.path.getsize(p) for p in glob.glob(os.path.join(AUDIO, "*.raw")))
+    size = sum(os.path.getsize(p) for ext in ("raw", "iq") for p in glob.glob(os.path.join(AUDIO, "*." + ext)))
     print(f"{len(metas)} recordings, {secs / 60:.0f} min of audio ({size / 1e6:.0f} MB), {len(bursts)} bursts of copy")
     rx = {}
     for m in metas:
@@ -208,6 +220,7 @@ def main():
     c.add_argument("--kiwi", help="host:port of a specific receiver instead of the best in the region")
     c.add_argument("--minutes", type=float, default=60)
     c.add_argument("--bands", nargs="+", default=["40", "30", "20"])
+    c.add_argument("--iq", action="store_true", help="also keep the raw I/Q of every dwell (.iq, 48 kB/s)")
     sub.add_parser("stats", help="summarize the corpus")
     a = ap.parse_args()
     if a.cmd == "stats":
@@ -219,7 +232,7 @@ def main():
         rx = kiwi.summarize(url, kiwi.status(url) or {})
         if not rx:
             raise SystemExit(f"{a.kiwi}: not reachable or not usable")
-    Capture(a.call, a.region, a.bands, rx).run(a.minutes)
+    Capture(a.call, a.region, a.bands, rx, a.iq).run(a.minutes)
 
 
 if __name__ == "__main__":

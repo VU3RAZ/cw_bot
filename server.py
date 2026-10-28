@@ -26,6 +26,8 @@ from spots import Spots
 from pathcheck import PathCheck
 from beacons import BeaconMonitor
 import geo
+import kiwi
+import kiwisdr
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 MSG_SCOPE, MSG_AUDIO, MSG_PCM = 1, 2, 3
@@ -38,7 +40,7 @@ class App:
         self.loop = None
         self.clients = set()
         # the last used radio if it is plugged in, else whichever is plugged in
-        detected = [r["name"] for r in rig.available() if r["connected"]]
+        detected = [r["name"] for r in rig.available() if r["connected"] and not r.get("network")]
         last = rig.load_settings().get("radio")
         self.radio_name = (args.radio or (last if last in detected else None)
                            or (detected[0] if detected else None) or last or "IC-7300")
@@ -61,6 +63,8 @@ class App:
         self.spots = Spots()
         self.pathcheck = PathCheck(self)
         self.beacons = BeaconMonitor(self)
+        self.last_audio = 0.0
+        self.kiwi_lists = {}        # region -> (time, rows): kiwi.find takes up to a minute
 
     # ---- broadcast helpers (thread-safe) -----------------------------
     def _send_all(self, data):
@@ -97,13 +101,70 @@ class App:
     # ---- radio selection ----------------------------------------------
     def make_radio(self, name, startup=False):
         a = self.args
+        if name in rig.NETWORK:
+            return rig.make(name)
         port = a.serial if startup and a.serial else rig.find_port(name)
         if name == "IC-7300":
             return IC7300(port, a.baud, int(a.civ, 16))
         return rig.make(name, port)
 
     def radios_info(self, avail=None):
-        return {"type": "radios", "current": self.radio_name, "radios": avail or rig.available(), "caps": self.radio.caps}
+        return {"type": "radios", "current": self.radio_name, "radios": avail or rig.available(), "caps": self.radio.caps,
+                "kiwi": {"receiver": (rig.load_settings().get("kiwi") or {}).get("url"),
+                         "regions": list(kiwi.REGIONS), "region": self.kiwi_region()}}
+
+    def kiwi_region(self):
+        """Region for the receiver list: the last one used, else the station's own, else Europe."""
+        r = rig.load_settings().get("kiwi_region")
+        if r in kiwi.REGIONS:
+            return r
+        loc = self.my_location()
+        for name, (la0, la1, lo0, lo1) in kiwi.REGIONS.items():
+            if loc and la0 <= loc[0] <= la1 and lo0 <= loc[1] <= lo1:
+                return name
+        return "europe"
+
+    async def kiwi_list(self, region, refresh=False):
+        """Public KiwiSDRs in a region, best first; the first one is the recommended one."""
+        if region not in kiwi.REGIONS:
+            raise RuntimeError(f"unknown region {region}")
+        rig.save_settings(kiwi_region=region)
+        t, rows = self.kiwi_lists.get(region, (0, None))
+        if refresh or rows is None or time.time() - t > 600:
+            self.broadcast_json(type="kiwi_list", region=region, loading=True)
+            rows = await self.loop.run_in_executor(None, kiwi.find, region, 25)
+            self.kiwi_lists[region] = (time.time(), rows)
+        me = self.my_location()
+        out = []
+        for r in rows:
+            t, why = kiwisdr.REFUSED.get(r["url"], (0, ""))
+            out.append(dict(r, km=round(geo.dist_bearing(me, (r["lat"], r["lon"]))[0]) if me else None,
+                            refused=why if time.time() - t < 1800 else ""))
+        rec = next((r["url"] for r in out if not r["refused"]), None)
+        self.broadcast_json(type="kiwi_list", region=region, receivers=out, recommended=rec,
+                            age=round(time.time() - self.kiwi_lists[region][0]))
+
+    def background(self, coro):
+        """Run a slow command without holding up this client's websocket; errors go to everyone."""
+        async def run():
+            try:
+                await coro
+            except Exception as e:
+                self.broadcast_json(type="error", msg=str(e))
+        asyncio.ensure_future(run())
+
+    async def kiwi_select(self, url):
+        rx = next((r for _, rows in self.kiwi_lists.values() for r in rows if r["url"] == url), None)
+        if rx is None:
+            rx = await self.loop.run_in_executor(None, lambda: kiwi.summarize(url, kiwi.status(url) or {}))
+            if not rx:
+                raise RuntimeError(f"{url}: not reachable or not usable")
+        rig.save_settings(kiwi=rx)
+        if self.radio_name == "KiwiSDR":
+            self.radio.set_receiver(rx)
+        else:
+            await self.select_radio("KiwiSDR")
+        self.broadcast_json(**self.radios_info())
 
     def clock_msg(self):
         return {"type": "clock", "clock": self.clock, "text": clock.describe(self.clock)}
@@ -144,10 +205,11 @@ class App:
                         self.broadcast_json(type="notice", msg=f"{n} {'detected' if c else 'disconnected'}")
             last = key
             cur = next(r for r in avail if r["name"] == self.radio_name)
-            if cur["connected"] and cur["port"] != self.radio.port:
+            if not cur.get("network") and cur["connected"] and cur["port"] != self.radio.port:
                 print(f"{self.radio_name} is now on {cur['port']}")
                 self.radio.port = cur["port"]          # the driver reopens it on its next attempt
-            other = next((r["name"] for r in avail if r["connected"] and r["name"] != self.radio_name), None)
+            other = next((r["name"] for r in avail if r["connected"] and not r.get("network")
+                          and r["name"] != self.radio_name), None)
             if not cur["connected"] and other:
                 if self.robot.active or self.beacons.active:
                     self.broadcast_json(type="notice", msg=f"{self.radio_name} is not connected; {other} is - "
@@ -159,6 +221,8 @@ class App:
             self.broadcast_json(**self.radios_info(avail))
 
     def audio_node(self):
+        if getattr(self.radio, "has_audio", False):
+            return None
         return self.args.audio or rig.audio_node_for(self.radio.port)
 
     def attach_radio(self):
@@ -188,6 +252,8 @@ class App:
 
     # ---- audio --------------------------------------------------------
     async def audio_task(self):
+        if getattr(self.radio, "has_audio", False):
+            return await self.network_audio()
         node = self.audio_node()
         while True:
             if shutil.which("pw-record") and node:
@@ -202,13 +268,7 @@ class App:
             chunk = FS // 10 * 2  # 100 ms
             try:
                 while True:
-                    data = await proc.stdout.readexactly(chunk)
-                    if not self.audio_ok:
-                        self.audio_ok = True
-                        self.broadcast_json(type="decoder", status=self.decoder_status())
-                    x = np.frombuffer(data, np.int16).astype(np.float32) / 32768
-                    self.process_audio(x, time.time())
-                    self.stream_audio(data)
+                    self.feed_pcm(await proc.stdout.readexactly(chunk))
             except (asyncio.IncompleteReadError, ConnectionError):
                 pass
             finally:
@@ -219,6 +279,28 @@ class App:
             print("audio stream ended; restarting in 2 s")
             await asyncio.sleep(2)
             node = self.audio_node()
+
+    def feed_pcm(self, data):
+        """100 ms of receive audio, 12 kHz s16le mono, from the sound card or the radio itself."""
+        self.last_audio = time.time()
+        if not self.audio_ok:
+            self.audio_ok = True
+            self.broadcast_json(type="decoder", status=self.decoder_status())
+        x = np.frombuffer(data, np.int16).astype(np.float32) / 32768
+        self.process_audio(x, time.time())
+        self.stream_audio(data)
+
+    async def network_audio(self):
+        """A radio that brings its own audio (KiwiSDR): it calls feed_pcm; flag gaps."""
+        self.radio.on_audio = self.feed_pcm
+        try:
+            while True:
+                await asyncio.sleep(1)
+                if self.audio_ok and time.time() - self.last_audio > 3:
+                    self.audio_ok = False
+                    self.broadcast_json(type="decoder", status=self.decoder_status())
+        finally:
+            self.radio.on_audio = None
 
     def stream_audio(self, pcm):
         if self.listeners:
@@ -326,6 +408,10 @@ class App:
             await self.select_radio(m["name"])
         elif c == "radios":
             self.broadcast_json(**self.radios_info())
+        elif c == "kiwi_list":
+            self.background(self.kiwi_list(m.get("region") or self.kiwi_region(), bool(m.get("refresh"))))
+        elif c == "kiwi_select":
+            await self.kiwi_select(m["url"])
         elif c == "send_cw":
             await run(r.send_cw, m["text"])
         elif c == "stop_cw":

@@ -3,7 +3,10 @@
 Each radio has a CAT serial port and its own USB audio codec behind the radio's
 internal USB hub, so the codec that belongs to a radio is the one sharing that hub
 with its serial port (both the IC-7300 and the FTDX10 use a TI "USB Audio CODEC",
-so names alone can't tell them apart)."""
+so names alone can't tell them apart).
+
+"KiwiSDR" is a public web receiver (kiwisdr.py), not a USB device: always available,
+never switched to automatically."""
 import glob
 import json
 import os
@@ -13,12 +16,14 @@ import subprocess
 from serial.tools import list_ports
 
 from ftdx10 import FTDX10
+from kiwisdr import KiwiRadio
 from radio import IC7300
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 SETTINGS = os.path.join(HERE, "settings.json")
 
-RADIOS = {"IC-7300": IC7300, "FTDX10": FTDX10}
+RADIOS = {"IC-7300": IC7300, "FTDX10": FTDX10, "KiwiSDR": KiwiRadio}
+NETWORK = {"KiwiSDR"}
 
 
 def _iface(device):
@@ -75,10 +80,14 @@ def find_port(name, found=None):
 
 
 def available():
-    """[{name, connected (= port present now), port}] for every supported radio."""
+    """[{name, connected (= port present now), port}] for every supported radio;
+    network receivers are always "connected", with network=True."""
     found = detect()
     out = []
     for n in RADIOS:
+        if n in NETWORK:
+            out.append({"name": n, "connected": True, "port": None, "network": True})
+            continue
         p = find_port(n, found)
         out.append({"name": n, "connected": bool(p and os.path.exists(p)), "port": p})
     return out
@@ -128,5 +137,7 @@ def audio_node_for(port):
 
 def make(name, port=None, baud=None):
     cls = RADIOS[name]
+    if name == "KiwiSDR":
+        return cls(load_settings().get("kiwi"))
     port = port or find_port(name)
     return cls(port, baud) if baud else cls(port)

@@ -255,6 +255,8 @@ class CWRobot:
             raise RuntimeError("robot already running")
         if self.app.beacons.active:
             raise RuntimeError("stop the beacon monitor first - both need the radio")
+        if not self.cfg["dry_run"] and self.app.radio.caps.get("rx_only"):
+            raise RuntimeError(f"{self.app.radio.name} is receive only: tick Dry run to listen and decode")
         if not re.fullmatch(r"[A-Z0-9/]{3,12}", self.cfg["mycall"] or ""):
             raise RuntimeError("set your callsign first")
         if not self.cfg["name"] or not self.cfg["qth"]:
