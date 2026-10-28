@@ -1,11 +1,12 @@
-"""Active CW stations from DX spotting networks.
+"""Active stations from DX spotting networks, all modes.
 
-Three sources, merged per callsign:
+Three sources, merged per callsign, band and mode:
 - DX Summit (http://www.dxsummit.fi) JSON API: human DX-cluster spots, no login.
 - HamQTH (https://www.hamqth.com) DX-cluster CSV: human spots, no login.
-- Reverse Beacon Network telnet (telnet.reversebeacon.net:7000): CW spots from automatic receivers
-  with measured SNR and WPM. RBN asks for a callsign at login, so the feed only
-  starts once ours is known (set_call).
+- Reverse Beacon Network telnet (telnet.reversebeacon.net:7000): CW and RTTY spots from
+  automatic receivers with measured SNR and WPM. RBN asks for a callsign at login, so the
+  feed only starts once ours is known (set_call).
+Cluster spots carry no mode field: mode_of() reads it from the comment, else the band plan.
 """
 import asyncio
 import calendar
@@ -26,7 +27,23 @@ CW_SEGMENTS = {
     "30": (10100, 10130), "20": (14000, 14070), "17": (18068, 18095), "15": (21000, 21070),
     "12": (24890, 24915), "10": (28000, 28070), "6": (50000, 50100),
 }
-NOT_CW = re.compile(r"\b(FT8|FT4|RTTY|PSK\d*|JT65|JS8|SSB|USB|LSB|FM|AM|SSTV|MSK144|Q65|DIGI)\b", re.I)
+# whole bands in kHz, and where phone starts (between the CW segment and this: data)
+BANDS = {
+    "160": (1800, 2000, 1843), "80": (3500, 4000, 3600), "60": (5250, 5450, 5354),
+    "40": (7000, 7300, 7060), "30": (10100, 10150, None), "20": (14000, 14350, 14101),
+    "17": (18068, 18168, 18111), "15": (21000, 21450, 21151), "12": (24890, 24990, 24931),
+    "10": (28000, 29700, 28300), "6": (50000, 54000, 50100),
+}
+# FT8 / FT4 dial frequencies: signals sit 0..3 kHz above them
+FT8_DIALS = (1840, 3573, 5357, 7074, 10136, 14074, 18100, 21074, 24915, 28074, 50313)
+FT4_DIALS = (3575, 7047.5, 10140, 14080, 18104, 21140, 24919, 28180, 50318)
+MODE_WORDS = [
+    ("FT8", re.compile(r"\bFT-?8\b", re.I)), ("FT4", re.compile(r"\bFT-?4\b", re.I)),
+    ("RTTY", re.compile(r"\bRTTY\b", re.I)),
+    ("DIGI", re.compile(r"\b(PSK\d*|BPSK\d*|JT65|JT9|JS8|SSTV|MSK144|Q65|OLIVIA|MFSK\d*|FST4W?|WSPR|DIGI)\b", re.I)),
+    ("SSB", re.compile(r"\b(SSB|USB|LSB)\b", re.I)), ("AM", re.compile(r"\bAM\b")),
+    ("FM", re.compile(r"\bFM\b")), ("CW", re.compile(r"\bCW\b", re.I)),
+]
 CALL = re.compile(r"^[A-Z0-9]{1,3}[0-9][A-Z0-9]{0,4}[A-Z](?:/[A-Z0-9]{1,4})?$|^[A-Z0-9]{1,4}/[A-Z0-9]{3,8}$")
 # DX de EA5WU-#:   14013.5  OH2BH          CW    17 dB  24 WPM  CQ      0519Z
 RBN_LINE = re.compile(r"^DX de (\S+?):\s+([\d.]+)\s+(\S+)\s+(\w+)\s+(-?\d+) dB\s+(\d+) (?:WPM|BPS)\s+(\S+)")
@@ -34,10 +51,35 @@ MAX_AGE = 3600
 
 
 def band_of(khz):
+    """Band name if khz is in that band's CW segment, else None."""
     for name, (lo, hi) in CW_SEGMENTS.items():
         if lo <= khz <= hi:
             return name
     return None
+
+
+def band_at(khz):
+    """Band name anywhere in the band, else None."""
+    for name, (lo, hi, _) in BANDS.items():
+        if lo <= khz <= hi:
+            return name
+    return None
+
+
+def mode_of(khz, info=""):
+    """CW / SSB / FT8 / FT4 / RTTY / DIGI / AM / FM: a mode named in the comment, else
+    the FT8/FT4 windows, else the band plan (CW segment, data, phone)."""
+    for mode, rx in MODE_WORDS:
+        if rx.search(info or ""):
+            return mode
+    for mode, dials in (("FT8", FT8_DIALS), ("FT4", FT4_DIALS)):
+        if any(0 <= khz - d <= 3 for d in dials):
+            return mode
+    if band_of(khz):
+        return "CW"
+    b = band_at(khz)
+    phone = b and BANDS[b][2]
+    return "SSB" if phone and khz >= phone else "DIGI"
 
 
 class RBNFeed:
@@ -84,14 +126,15 @@ class RBNFeed:
 
     def _parse(self, line):
         m = RBN_LINE.match(line)
-        if not m or m.group(4) != "CW":
+        if not m or m.group(4) not in ("CW", "RTTY"):
             return
-        spotter, khz, call, _, snr, wpm, kind = m.groups()
+        spotter, khz, call, mode, snr, wpm, kind = m.groups()
         if kind in ("BEACON", "NCDXF"):
             return
         now = time.time()
         self.spots.append({"call": call, "khz": float(khz), "ts": now, "spotter": spotter.rstrip("-#"),
-                           "snr": int(snr), "wpm": int(wpm), "info": kind, "source": "rbn"})
+                           "snr": int(snr), "wpm": int(wpm) if mode == "CW" else None, "info": kind,
+                           "source": "rbn", "mode": mode})
         if len(self.spots) > 20000 or self.spots[0]["ts"] < now - MAX_AGE:
             self.spots = [s for s in self.spots if s["ts"] >= now - MAX_AGE]
 
@@ -117,7 +160,7 @@ class Spots:
         async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=15)) as s:
             results = await asyncio.gather(self._fetch(s, "dxsummit", self._dxsummit),
                                            self._fetch(s, "hamqth", self._hamqth))
-        self.dxs = [x for spots in results for x in spots if not NOT_CW.search(x["info"])]
+        self.dxs = [dict(x, mode=mode_of(x["khz"], x["info"])) for spots in results for x in spots]
 
     async def _fetch(self, session, name, fn):
         try:
@@ -130,7 +173,7 @@ class Spots:
 
     @staticmethod
     async def _dxsummit(session):
-        async with session.get(DXSUMMIT_URL, params={"limit": 500, "include_modes": "CW"}) as r:
+        async with session.get(DXSUMMIT_URL, params={"limit": 500}) as r:
             data = await r.json(content_type=None)
         return [{"call": d["dx_call"], "khz": float(d["frequency"]),
                  "ts": calendar.timegm(time.strptime(d["time"], "%Y-%m-%dT%H:%M:%S")),
@@ -153,19 +196,21 @@ class Spots:
                           "source": "hamqth", "country": f[9]})
         return spots
 
-    async def active(self, band=None, max_age=900, me=None, pathcheck=None):
-        """Stations spotted on CW within max_age seconds, newest first. One entry per
-        call (per band): its latest frequency plus how many spotters heard it.
+    async def active(self, band=None, max_age=900, me=None, pathcheck=None, mode=None):
+        """Stations spotted within max_age seconds, newest first, all modes unless mode
+        is given. One entry per call, band and mode: its latest frequency plus how many
+        spotters heard it.
         me: our (lat, lon), adds km to each station. pathcheck: a PathCheck whose last
         result marks stations whose spotters are near a receiver that heard us."""
         await self._cluster()
         cutoff = time.time() - max_age
         by_call = {}
         for s in sorted(self.dxs + self.rbn.spots, key=lambda s: s["ts"]):
-            b = band_of(s["khz"])
-            if s["ts"] < cutoff or not b or (band and b != band) or s["call"] == self.rbn.call:
+            b, md = band_at(s["khz"]), s.get("mode", "CW")
+            if (s["ts"] < cutoff or not b or (band and b != band) or (mode and md != mode)
+                    or s["call"] == self.rbn.call):
                 continue
-            e = by_call.setdefault((s["call"], b), {"call": s["call"], "band": b, "spotters": set(),
+            e = by_call.setdefault((s["call"], b, md), {"call": s["call"], "band": b, "mode": md, "spotters": set(),
                                                     "sources": set(), "snr": None, "wpm": None,
                                                     "info": "", "country": ""})
             e["khz"], e["ts"] = s["khz"], s["ts"]          # latest spot wins
@@ -199,7 +244,7 @@ class Spots:
         cutoff, best = time.time() - max_age, {}
         for s in self.rbn.spots:
             b = band_of(s["khz"])
-            if s["ts"] < cutoff or not b or (bands and b not in bands):
+            if s["ts"] < cutoff or not b or (bands and b not in bands) or s.get("mode", "CW") != "CW":
                 continue
             sl = geo.locate(s["spotter"])
             if not sl:

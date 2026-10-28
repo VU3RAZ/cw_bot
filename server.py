@@ -16,7 +16,7 @@ import time
 import numpy as np
 from aiohttp import web, WSMsgType
 
-from decoders import FS, Spectrum, CWDecoder, RTTYDecoder, FT8Decoder
+from decoders import FS, Spectrum, CWDecoder, PitchTracker, RTTYDecoder, FT8Decoder
 from cwhmm import CWHmm
 from radio import IC7300
 import rig
@@ -52,6 +52,10 @@ class App:
         self.cw2 = None            # second CW decoder on the same audio ("both"), follows cw's pitch
         self.cw_engine = "standard"
         self.set_cw_engine(rig.load_settings().get("cw_engine", "standard"))
+        self.cw_afc = bool(rig.load_settings().get("cw_afc", True))
+        self.afc = PitchTracker()
+        self.afc_sent, self.afc_shown = 0.0, 0.0    # last AFC update sent to the browser
+        self.cw_anchor = self.cw.freq   # where the decoder was put (pitch or a click): AFC searches near it
         self.rtty = RTTYDecoder(2210)
         self.ft8 = FT8Decoder()
         self.enabled = {"cw": True, "rtty": False, "ft8": False}
@@ -88,13 +92,15 @@ class App:
         if "cw_pitch" in changed and self.loop:
             # keep the CW decoder on the radio's sidetone pitch (where a zero-beat signal lands)
             self.loop.call_soon_threadsafe(self.follow_pitch, changed["cw_pitch"])
+        if "freq" in changed:
+            self.afc.reset()        # a QSY: the last seconds of audio are another station
 
     def on_scope(self, lo, hi, px):
         self.broadcast(struct.pack("<Bii", MSG_SCOPE, lo, hi) + px)
 
     def decoder_status(self):
         return {"cw_freq": self.cw.freq, "cw_wpm": round(self.cw.wpm, 1), "cw_engine": self.cw_engine,
-                "cw_squelch": self.cw.squelch, "cw_warning": self.cw_warning, "rtty_freq": self.rtty.center, "rtty_mark_high": self.rtty.mark_high,
+                "cw_squelch": self.cw.squelch, "cw_afc": self.cw_afc, "cw_warning": self.cw_warning, "rtty_freq": self.rtty.center, "rtty_mark_high": self.rtty.mark_high,
                 "rtty_shift": self.rtty.shift, "rtty_baud": self.rtty.baud,
                 "ft4": self.ft8.ft4, "enabled": self.enabled, "audio": self.audio_ok}
 
@@ -316,6 +322,8 @@ class App:
         for row in self.spectrum.feed(x):
             self._send_all(bytes([MSG_AUDIO]) + row)
         if self.enabled["cw"]:
+            if self.cw_afc:
+                self.track_pitch(x)
             txt = self.cw.feed(x)
             if txt:
                 self.broadcast_json(type="cw", text=txt, wpm=round(self.cw.wpm, 1))
@@ -446,8 +454,31 @@ class App:
             self.set_decoder(m)
             self.broadcast_json(type="decoder", status=self.decoder_status())
 
+    def track_pitch(self, x):
+        """AFC (decoders.PitchTracker): find the keyed tone within ~2 s, then follow it
+        to about a hertz. In CW mode it searches the radio's filter passband; otherwise
+        +-150 Hz around where the decoder was put."""
+        st = self.radio.state
+        pitch, width = st.get("cw_pitch") or 0, st.get("if_width") or 0
+        if str(st.get("mode", "")).startswith("CW") and pitch and width:
+            lo, hi = pitch - width / 2 - 25, pitch + width / 2 + 25
+        else:
+            lo, hi = self.cw_anchor - 150, self.cw_anchor + 150
+        hz = self.afc.feed(x, self.cw, max(200, lo), min(3000, hi))
+        if hz is None:
+            return
+        jump = abs(hz - self.cw.freq) > 50
+        self.cw.retune(hz) if not jump else self.cw.set_freq(hz)
+        # the loop nudges up to 10x a second: tell the browser on a jump, else 4x a second
+        now = time.time()
+        if jump or (now - self.afc_sent > 0.25 and abs(hz - self.afc_shown) >= 1):
+            self.afc_sent, self.afc_shown = now, hz
+            self.broadcast_json(type="decoder", status=self.decoder_status())
+
     def follow_pitch(self, pitch):
         self.cw.set_freq(pitch)
+        self.cw_anchor = pitch
+        self.afc.reset()
         self.cw_warning = ""
         self._send_all(json.dumps({"type": "decoder", "status": self.decoder_status()}))
 
@@ -491,6 +522,11 @@ class App:
             self.cw_warning = self.outside_passband(f)
             if not self.cw_warning:
                 self.cw.set_freq(f)
+                self.cw_anchor = f
+                self.afc.reset()
+        if "cw_afc" in m:
+            self.cw_afc = bool(m["cw_afc"])
+            rig.save_settings(cw_afc=self.cw_afc)
         if "cw_squelch" in m:
             for d in (self.cw, self.cw2):
                 if d:
@@ -503,7 +539,7 @@ class App:
     async def spots_handler(self, request):
         q = request.query
         stations = await self.spots.active(q.get("band"), int(q.get("max_age", 900)),
-                                           self.my_location(), self.pathcheck)
+                                           self.my_location(), self.pathcheck, q.get("mode"))
         return web.json_response({"stations": stations, "status": self.spots.status(),
                                   "pathcheck": self.pathcheck.public()})
 

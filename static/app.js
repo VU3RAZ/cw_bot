@@ -493,6 +493,7 @@ function renderDecoder() {
   $('enCw').checked = dec.enabled.cw; $('enRtty').checked = dec.enabled.rtty; $('enFt8').checked = dec.enabled.ft8;
   $('ft4').checked = dec.ft4; $('ft8Name').textContent = dec.ft4 ? 'FT4' : 'FT8';
   $('cwSql').value = dec.cw_squelch;
+  $('cwAfc').checked = dec.cw_afc;
   $('cwEngine').value = dec.cw_engine;
   $('cw2Box').hidden = dec.cw_engine !== 'both';
   if (state.mode && dec.rtty_mark_high !== (defaultMarkHigh() !== $('rttyRev').checked))
@@ -510,6 +511,7 @@ const defaultMarkHigh = () => !['LSB', 'RTTY'].includes(state.mode);
 
 $('enCw').onchange = (ev) => send({ cmd: 'decoder', enable: { cw: ev.target.checked } });
 $('cwSql').onchange = (ev) => send({ cmd: 'decoder', cw_squelch: +ev.target.value });
+$('cwAfc').onchange = (ev) => send({ cmd: 'decoder', cw_afc: ev.target.checked });
 $('cwEngine').onchange = (ev) => send({ cmd: 'decoder', cw_engine: ev.target.value });
 $('enRtty').onchange = (ev) => send({ cmd: 'decoder', enable: { rtty: ev.target.checked }, rtty_mark_high: defaultMarkHigh() !== $('rttyRev').checked });
 $('rttyRev').checked = lsGet('rttyRev', false);
@@ -679,11 +681,12 @@ function robotEvent(m) {
   el.scrollTop = el.scrollHeight;
 }
 
-// ------------------------------------------------------------ CW spots (DX Summit + RBN)
+// ------------------------------------------------------------ spots (DX Summit + HamQTH + RBN), all modes
 $('spBand').innerHTML = '<option value="">Current band</option><option value="all">All bands</option>'
   + BANDS.map((b) => `<option value="${b[0]}">${b[0]} m</option>`).join('');
 $('spBand').value = lsGet('spBand', '');
 $('spAge').value = lsGet('spAge', '900');
+$('spMode').value = lsGet('spMode', '');
 function spotsBand() {
   const v = $('spBand').value;
   if (v === 'all') return null;
@@ -697,43 +700,63 @@ function requestSpots() {
   send({ cmd: 'spots', band: spotsBand(), max_age: +$('spAge').value, call: call || undefined });
 }
 for (const id of ['spBand', 'spAge']) $(id).onchange = () => { lsSet(id, $(id).value); requestSpots(); };
+$('spMode').onchange = () => { lsSet('spMode', $('spMode').value); if (renderSpots.last) renderSpots(renderSpots.last); };
 $('spRefresh').onclick = requestSpots;
 setInterval(() => { if (ws && ws.readyState === 1) requestSpots(); }, 60000);
 
 function fmtAge(s) { return s < 60 ? `${s}s` : s < 3600 ? `${Math.floor(s / 60)}m` : `${Math.floor(s / 3600)}h`; }
+// clicking a spot tunes the radio to it in its mode; FT8/FT4 snap to the dial frequency
+const FT_DIALS = { FT8: BANDS.map((b) => b[5]), FT4: BANDS.map((b) => b[6]) };
+function qsySpot(st) {
+  const hz = Math.round(st.khz * 1000);
+  const sideband = hz < 10e6 && !(hz >= 5.25e6 && hz <= 5.45e6) ? 'LSB' : 'USB';
+  if (st.mode === 'CW') {
+    send({ cmd: 'mode', mode: 'CW', data: false });
+    setFreq(hz);
+    if (state.cw_pitch) send({ cmd: 'decoder', cw_freq: state.cw_pitch });
+    if (!robotInQso) { clearOther(false); $('rbTarget').value = st.call; setSrc('call', 'you'); }
+  } else if (st.mode === 'SSB') {
+    send({ cmd: 'mode', mode: sideband, data: false }); setFreq(hz);
+  } else if (st.mode === 'RTTY') {
+    send({ cmd: 'mode', mode: 'RTTY', data: false }); setFreq(hz);     // spot = mark, the RTTY dial
+  } else if (st.mode === 'AM' || st.mode === 'FM') {
+    send({ cmd: 'mode', mode: st.mode, data: false }); setFreq(hz);
+  } else {                                                             // FT8 / FT4 / other data: USB-D
+    const dial = (FT_DIALS[st.mode] || []).find((d) => d && hz - d >= 0 && hz - d <= 3000);
+    send({ cmd: 'mode', mode: 'USB', data: true }); setFreq(dial || hz - 1500);
+  }
+}
 function renderSpots(m) {
   if ((m.band || null) !== spotsBand()) return;   // reply to another client's / an older request
+  renderSpots.last = m;
+  const mode = $('spMode').value;
+  const shown = mode ? m.stations.filter((st) => st.mode === mode) : m.stations;
   const rbn = m.status.rbn;
-  $('spInfo').textContent = `${m.stations.length} stations · RBN ${rbn.connected ? 'connected as ' + rbn.call
+  $('spInfo').textContent = `${shown.length}${mode ? ' ' + mode + ' of ' + m.stations.length : ''} stations · RBN ${rbn.connected ? 'connected as ' + rbn.call
     : rbn.call ? 'connecting…' + (rbn.error ? ' (' + rbn.error + ')' : '') : 'off (enter your callsign)'}`
     + Object.entries(m.status.errors).map(([k, v]) => ` · ${k} error: ${v}`).join('');
   const body = $('spBody'); body.textContent = '';
-  if (!m.stations.length) {
+  if (!shown.length) {
     const td = body.insertRow().insertCell();
-    td.colSpan = 10; td.className = 'hint';
-    td.textContent = `No CW spots ${m.band ? 'on ' + m.band + ' m ' : ''}in the last ${$('spAge').selectedOptions[0].text}.`
+    td.colSpan = 11; td.className = 'hint';
+    td.textContent = `No ${mode || ''} spots ${m.band ? 'on ' + m.band + ' m ' : ''}in the last ${$('spAge').selectedOptions[0].text}.`
       + (rbn.connected ? '' : ' Enter your callsign in the robot panel to add live Reverse Beacon Network spots,')
-      + ' or try All bands / a longer window.';
+      + ' or try All bands / All modes / a longer window.';
   }
   // stations on a path our last path check proved open come first
-  const stations = [...m.stations].sort((a, b) => !!b.path - !!a.path);
+  const stations = [...shown].sort((a, b) => !!b.path - !!a.path);
   for (const st of stations) {
     const tr = document.createElement('tr');
     if (/\bCQ\b/.test(st.info)) tr.className = 'cq';
     if (st.path) tr.classList.add('path');
     tr.title = `${st.sources.join(' + ')}`
       + (st.path ? ` · spotted ${st.path[0]} km from ${st.path[1]}, who heard your path check` : '')
-      + ' · click to tune and set as robot target';
-    for (const v of [fmtAge(st.age), st.khz.toFixed(1), st.call, st.wpm ?? '', st.snr ?? '', st.spotters,
+      + ` · click to tune in ${st.mode}` + (st.mode === 'CW' ? ' and set as robot target' : '');
+    for (const v of [fmtAge(st.age), st.khz.toFixed(1), st.mode, st.call, st.wpm ?? '', st.snr ?? '', st.spotters,
                      st.km ?? '', st.path ? '✓' : '', st.country, st.info]) {
       const td = document.createElement('td'); td.textContent = v; tr.appendChild(td);
     }
-    tr.onclick = () => {
-      send({ cmd: 'mode', mode: 'CW', data: false });
-      setFreq(Math.round(st.khz * 1000));
-      if (state.cw_pitch) send({ cmd: 'decoder', cw_freq: state.cw_pitch });
-      if (!robotInQso) { clearOther(false); $('rbTarget').value = st.call; setSrc('call', 'you'); }
-    };
+    tr.onclick = () => qsySpot(st);
     body.appendChild(tr);
   }
 }

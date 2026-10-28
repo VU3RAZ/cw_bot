@@ -246,6 +246,136 @@ class CWDecoder:
 CWDecoder.load_params()
 
 
+def keyed_contrast(x, lo=300, hi=2700):
+    """(Hz, dB) arrays: per 25 Hz bin, the on/off contrast of its level (p97 - p30).
+    A keyed CW tone scores high; noise (~12 dB) and steady carriers don't."""
+    n = 480
+    fr = x[:len(x) // n * n].reshape(-1, n) * np.hanning(n)
+    S = 10 * np.log10(np.abs(np.fft.rfft(fr, axis=1)) ** 2 + 1e-12)
+    f = np.fft.rfftfreq(n, 1 / FS)
+    band = (f >= lo) & (f <= hi)
+    return f[band], np.percentile(S[:, band], 97, axis=0) - np.percentile(S[:, band], 30, axis=0)
+
+
+class PitchTracker:
+    """AFC for the CW decoder, in two parts.
+
+    Acquire: every EVERY seconds, the keyed tone with the most on/off contrast in the
+    last HIST seconds between lo and hi. If the decoder isn't on a keyed tone, or
+    another is STAY dB more contrasty, it jumps there (to a few Hz) once two checks in
+    a row agree. For HANG seconds after its tone stops (a DX listening to callers, the
+    other side of a QSO) a new tone still has to beat the old one by STAY dB.
+
+    Track (only while acquire finds the decoder on a keyed tone, never on bare noise):
+    a frequency-locked loop. The audio is mixed down at the decoder's pitch and
+    low-passed to +-FLL_BW Hz; during key-down (samples GATE x the noise and within
+    PEAK_FRAC of the tone's peak, so key-up noise and a weaker neighbour don't count)
+    the phase advance over LAG samples is the tone's offset, and the decoder moves
+    GAIN of it every block. That follows drift and chirp within a fraction of a second,
+    to about a hertz, mid-character too: retune() keeps the decoder's filter state."""
+    EVERY, HIST, MIN_HIST = 0.25, 2.0, 1.5
+    MIN_CONTRAST = 20.0     # dB; noise measures ~12, a clean keyed signal 30-45
+    STAY = 6.0              # dB another tone must beat the current one by
+    HANG = 3.0              # s the last tone is held after it stops
+    NEAR = 30.0             # Hz: the decoder is "on" a tone this close
+    FLL_BW = 75.0           # Hz: the loop pulls in offsets this big; acquire does the rest
+    LAG = 12                # samples (1 ms): phase advance 2 pi f LAG / FS, unambiguous to 500 Hz
+    GATE = 4.0              # key-down: power this many times the noise (noise passes 1.8 %)
+    PEAK_FRAC = 0.25        # ...and at least this fraction of the tone's recent peak
+    MIN_MARK = 120          # samples (10 ms) of key-down in a block before it measures
+    GAIN = 0.5
+    MAX_STEP = 10.0         # Hz per block: 100 Hz/s at 100 ms blocks, far above real drift
+
+    def __init__(self):
+        self.b, self.a = signal.butter(4, self.FLL_BW / (FS / 2))
+        self.reset()
+
+    def reset(self):
+        self.hist, self.n = np.zeros(0, np.float32), 0
+        self.phase, self.zi = 0.0, signal.lfilter_zi(self.b, self.a) * 0
+        self.tail = np.zeros(self.LAG, complex)
+        self.floor, self.noise, self.peak = [], None, 0.0
+        self.locked = False             # acquire found a keyed tone at the decoder's pitch
+        self.t = 0.0                    # seconds of audio seen
+        self.held = (0.0, -1e9)         # (contrast, time) of the tone last locked
+        self.cand = None                # pitch the last check wanted to jump to
+
+    def feed(self, x, dec, lo, hi):
+        """Returns the new pitch if dec should move, else None."""
+        hz = self._acquire(x, dec, lo, hi)
+        if hz is not None:
+            self.peak = 0.0             # a new tone: learn its level
+            return hz
+        hz = self._track(x, dec.freq)
+        return min(max(hz, lo), hi) if hz is not None and self.locked else None
+
+    def _track(self, x, freq):
+        w = 2 * np.pi * freq / FS
+        lo = np.exp(-1j * (self.phase + w * np.arange(len(x))))
+        self.phase = (self.phase + w * len(x)) % (2 * np.pi)
+        z, self.zi = signal.lfilter(self.b, self.a, x * lo, zi=self.zi)
+        z = np.concatenate([self.tail, z])
+        self.tail = z[-self.LAG:]
+        p = np.abs(z) ** 2
+        # mean noise power: median / ln 2 of a key-up block; the lowest over the last 2 s
+        self.floor = (self.floor + [float(np.median(p)) / np.log(2)])[-max(2, int(2 * FS / len(x))):]
+        if len(self.floor) < 3:
+            return None                 # the filter is still settling
+        self.noise = min(self.floor[1:])
+        self.peak = max(float(np.percentile(p, 99)), self.peak * 0.97)
+        on = (p > self.GATE * self.noise) & (p > self.PEAK_FRAC * self.peak)
+        g = on[self.LAG:] & on[:-self.LAG]
+        if g.sum() < self.MIN_MARK:
+            return None
+        s = np.sum(z[self.LAG:][g] * np.conj(z[:-self.LAG][g]))
+        df = np.angle(s) * FS / (2 * np.pi * self.LAG)
+        step = max(-self.MAX_STEP, min(self.MAX_STEP, self.GAIN * df))
+        return freq + step if abs(df) > 0.5 else None
+
+    def _acquire(self, x, dec, lo, hi):
+        self.hist = np.concatenate([self.hist, x])[-int(FS * self.HIST):]
+        self.n += len(x)
+        self.t += len(x) / FS
+        if self.n < FS * self.EVERY or len(self.hist) < FS * self.MIN_HIST:
+            return None
+        self.n = 0
+        f, c = keyed_contrast(self.hist, lo, hi)
+        if len(c) < 3:
+            return None
+        near = np.flatnonzero(np.abs(f - dec.freq) <= self.NEAR)
+        here = c[near].max() if len(near) else 0.0
+        self.locked = here >= self.MIN_CONTRAST
+        if self.locked:
+            self.held = (here, self.t)
+        i = int(np.argmax(c))
+        if c[i] < self.MIN_CONTRAST:
+            self.cand = None
+            return None
+        if self.locked and (c[i] < here + self.STAY or getattr(dec, "key", False)):
+            self.cand = None
+            return None                 # on a keyed tone: the loop keeps it centred
+        if self.t - self.held[1] < self.HANG and c[i] < self.held[0] + self.STAY:
+            self.cand = None
+            return None                 # its tone just paused: hold it
+        hz = self._refine(f, c, i)
+        if abs(hz - dec.freq) <= self.NEAR:
+            return None
+        if self.cand is None or abs(hz - self.cand) > self.NEAR:
+            self.cand = hz              # confirm on the next check first
+            return None
+        self.cand, self.locked, self.held = None, True, (c[i], self.t)
+        return hz
+
+    @staticmethod
+    def _refine(f, c, i):
+        """Parabolic peak: 25 Hz bins -> a few Hz."""
+        if 0 < i < len(c) - 1:
+            d = c[i - 1] - 2 * c[i] + c[i + 1]
+            if d < 0:
+                return float(f[i] + 0.5 * (c[i - 1] - c[i + 1]) / d * (f[1] - f[0]))
+        return float(f[i])
+
+
 # ---------------------------------------------------------------- RTTY
 ITA2_LTRS = "\x00E\nA SIU\rDRJNFCKTZLWHYPQOBG\x0eMXV\x0f"
 ITA2_FIGS = "\x003\n- '87\r$4\x07,!:(5\")2#6019?&\x0e./;\x0f"

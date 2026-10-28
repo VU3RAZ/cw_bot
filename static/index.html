@@ -105,6 +105,7 @@
         <select id="cwEngine" class="small" title="CW decoder: Std = threshold decoder, HMM = statistical decoder (~2 s later), Both = Std copy with the HMM's copy underneath, same audio">
           <option value="standard">Std</option><option value="hmm">HMM</option><option value="both">Both</option>
         </select>
+        <label class="chk hint" title="AFC: finds the keyed tone in ~2 s and follows it to about a hertz (within the CW filter, or ±150 Hz of where you put the decoder)"><input type="checkbox" id="cwAfc"> AFC</label>
         <span id="cwInfo" class="hint"></span>
         <label class="chk hint" title="Squelch: signal must be this many times above the noise">SQL <input type="range" id="cwSql" min="2" max="20" step="0.5" value="6" style="width:70px"></label>
         <button class="small" data-clear="cwOut">Clear</button>
@@ -140,10 +141,14 @@
     </div>
   </section>
 
-  <section class="spots" data-title="CW Spots">
+  <section class="spots" data-title="Spots">
     <div class="dec-head">
-      <b>CW Spots</b>
+      <b>Spots</b>
       <select id="spBand" title="Band"></select>
+      <select id="spMode" title="Mode">
+        <option value="">All modes</option><option>CW</option><option>SSB</option><option>FT8</option>
+        <option>FT4</option><option>RTTY</option><option>DIGI</option><option>AM</option><option>FM</option>
+      </select>
       <select id="spAge" title="Spotted within">
         <option value="300">5 min</option><option value="900" selected>15 min</option>
         <option value="1800">30 min</option><option value="3600">1 hour</option>
@@ -152,7 +157,7 @@
       <span id="spInfo" class="hint"></span>
     </div>
     <div class="dec-out table spots-table">
-      <table><thead><tr><th>Age</th><th>kHz</th><th>Call</th><th>WPM</th><th>SNR</th><th>Spots</th><th>km</th><th>Path</th><th>Country</th><th>Info</th></tr></thead>
+      <table><thead><tr><th>Age</th><th>kHz</th><th>Mode</th><th>Call</th><th>WPM</th><th>SNR</th><th>Spots</th><th>km</th><th>Path</th><th>Country</th><th>Info</th></tr></thead>
       <tbody id="spBody"></tbody></table>
     </div>
   </section>

@@ -77,7 +77,13 @@ reference).
 - **Panadapter**: click to tune, mouse wheel steps by the Step setting; span / center-fixed / sweep speed set the radio scope.
 - **Frequency**: mouse wheel over a digit tunes that digit; click it to type (kHz or MHz). Arrow keys step.
 - **Audio waterfall**: click a signal to point the CW (snaps to the peak) or RTTY decoder at it.
-- **CW**: auto speed tracking; raise SQL if it prints noise. Send box uses the radio's keyer (CW mode, break-in on).
+- **CW**: auto speed tracking; raise SQL if it prints noise. **AFC** (on by default) puts the decoder on the station and keeps it there:
+  every 0.25 s it looks for the tone with the most on/off contrast in the last 2 s (inside the CW filter, or ±150 Hz of
+  where you put the decoder in other modes) and jumps there once two checks agree, typically 1.5-2 s after the station
+  starts sending. A frequency-locked loop then measures the tone's phase during every key-down and keeps the decoder
+  centred, mid-character too: on a test tone drifting 8 Hz/s it stays within 1.5 Hz (median). It ignores noise and
+  carriers, holds a station for 3 s after it stops (a DX listening, the other side of a QSO) unless another is 6 dB
+  stronger, and starts over after a QSY. Send box uses the radio's keyer (CW mode, break-in on).
   - The decoder selector picks **Std** (threshold decoder), **HMM** (statistical decoder, better on weak and fast
     signals, prints about 2 s late) or **Both**, which shows the HMM's copy under the standard copy on the same
     audio and pitch, for live comparison. The robot uses the HMM only when HMM alone is selected. The choice is saved in `settings.json`.
@@ -88,10 +94,13 @@ reference).
 - **FT8/FT4**: "Go to FT8 freq" sets USB-D on the current band's FT8 frequency. Needs the PC clock NTP-synced.
   Decoding uses [ft8_lib](https://github.com/kgoba/ft8_lib); "Str" is ft8_lib's score, not WSJT-X SNR.
 
-- **CW Spots**: stations recently spotted on CW in the band's CW segment, from [DX Summit](http://www.dxsummit.fi), [HamQTH](https://www.hamqth.com)
-  and the [Reverse Beacon Network](https://reversebeacon.net) (spotter SNR/WPM). RBN logs in with your callsign
-  (robot Callsign field, or `--rbn-call`). Click a row to switch to CW, tune to the station, and make it the robot's
-  Answer target. Also available as `GET /api/spots?band=20&max_age=900`.
+- **Spots**: stations recently spotted anywhere in the band, all modes, from [DX Summit](http://www.dxsummit.fi), [HamQTH](https://www.hamqth.com)
+  and the [Reverse Beacon Network](https://reversebeacon.net) (CW and RTTY, spotter SNR/WPM). RBN logs in with your callsign
+  (robot Callsign field, or `--rbn-call`). Cluster spots carry no mode, so it is read from the comment (FT8, RTTY, SSB, PSK…),
+  else from the band plan: FT8/FT4 windows, CW segment, data, phone. The Mode dropdown filters the list. Click a row to
+  tune the radio (or the KiwiSDR) there in that mode: CW also becomes the robot's Answer target; SSB picks LSB below
+  10 MHz (USB on 60 m); RTTY tunes the mark; FT8/FT4 go to USB-D on the standard dial frequency, other data to USB-D
+  1.5 kHz below the spot. Also available as `GET /api/spots?band=20&max_age=900&mode=CW`.
 - **Path check** (robot panel): tune into a band's CW segment, then the robot sends `QRL?`, listens, and calls CQ 3 times
   (answers are worked as a normal QSO). Who heard you is collected live from RBN and, once at the end (~4 min),
   from PSKReporter (max one query per 5 min): receiver, country, distance/bearing from your Grid (or your callsign's

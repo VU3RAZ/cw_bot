@@ -632,8 +632,8 @@ class CWRobot:
 
     def _afc(self):
         """Keep the decoder on the station within +-150 Hz of the radio's CW pitch."""
-        if not self.cfg["afc"] or self.anchor is None:
-            return
+        if not self.cfg["afc"] or self.anchor is None or self.app.cw_afc:
+            return                  # the decoder's own AFC (server.track_pitch) is on
         cw = self.app.cw
         if cw.level() < 8:
             return

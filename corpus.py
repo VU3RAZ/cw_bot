@@ -92,7 +92,7 @@ class Capture:
         if near:
             return dict(near[0], why=f"RBN spotter {near[0]['spotter_km']} km from the receiver, "
                                      f"{near[0]['snr']} dB")
-        allspots = asyncio.run_coroutine_threadsafe(self.spots.active(None, 600), self.loop).result(60)
+        allspots = asyncio.run_coroutine_threadsafe(self.spots.active(None, 600, mode="CW"), self.loop).result(60)
         for s in sorted(allspots, key=lambda s: -(s.get("spotters") or 0)):
             dx = geo.locate(s["call"])
             if s["band"] in self.bands and fresh(s) and dx and geo.dist_bearing(loc, dx)[0] < CLUSTER_KM:
